@@ -12,7 +12,7 @@ import requests
 DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
 
-# 🚨 SAFETY SWITCH: FALSE = REAL MERGES 🚨
+# 🚨 SAFETY SWITCH: FALSE = REAL MERGES (DESTRUCTIVE) 🚨
 DRY_RUN = False  
 
 CHECKPOINT_FILE = "merge_checkpoint.json"
@@ -24,7 +24,7 @@ BASE_URL = f"https://{DOMAIN}/api/v2"
 AUTH = (API_KEY, "X")
 HEADERS = {"Content-Type": "application/json"}
 
-# --- SETUP LOGGING ---
+# --- SETUP LOGGING (File + Console) ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
@@ -78,7 +78,7 @@ def get_all_tickets():
             if check_rate_limit(response): continue
             
             if response.status_code != 200:
-                log(f"❌ Error fetching page {page}: {response.status_code} - {response.text}")
+                log(f"❌ Error fetching page {page}: {response.text}")
                 break
                 
             data = response.json()
