@@ -12,8 +12,8 @@ import requests
 DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
 
-# Set to False to ACTUALLY merge tickets
-DRY_RUN = True  
+# 🚨 SAFETY SWITCH: FALSE = REAL MERGES (DESTRUCTIVE) 🚨
+DRY_RUN = False  
 
 CHECKPOINT_FILE = "merge_checkpoint.json"
 LOG_FILE = "merge_tickets.log"
@@ -25,7 +25,6 @@ AUTH = (API_KEY, "X")
 HEADERS = {"Content-Type": "application/json"}
 
 # --- SETUP LOGGING (File + Console) ---
-# This saves logs to 'merge_tickets.log' AND prints to the screen
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
@@ -101,7 +100,6 @@ def merge_tickets(primary_id, secondary_ids):
     payload = { "secondary_ticket_ids": secondary_ids }
     
     if DRY_RUN:
-        # log(f"   [DRY RUN] Would merge {len(secondary_ids)} tickets") # Reduced noise
         return True
             
     try:
@@ -143,7 +141,6 @@ def run_merge_process():
     # 3. Prepare Work List
     work_list = []
     for requester_id, user_tickets in tickets_by_requester.items():
-        # Skip if done or not enough tickets
         if str(requester_id) in processed_requesters or requester_id in processed_requesters:
             continue
         if len(user_tickets) < 2:
@@ -160,13 +157,11 @@ def run_merge_process():
     
     for i, (requester_id, user_tickets) in enumerate(work_list):
         
-        # Sort & Identify
         user_tickets.sort(key=lambda x: x['created_at'])
         primary = user_tickets[-1] 
         secondary_tickets = user_tickets[:-1]
         secondary_ids = [t['id'] for t in secondary_tickets]
         
-        # Perform Merge
         success = merge_tickets(primary['id'], secondary_ids)
         
         if success:
@@ -175,18 +170,17 @@ def run_merge_process():
         
         processed_count += 1
         
-        # --- ETA CALCULATION ---
-        if processed_count % 5 == 0: # Update stats every 5 groups
+        if processed_count % 5 == 0: 
             elapsed = time.time() - start_time
-            avg_time = elapsed / processed_count
-            remaining = total_groups - processed_count
-            eta_seconds = remaining * avg_time
-            
-            percent = (processed_count / total_groups) * 100
-            log(f"⏳ Progress: {percent:.1f}% | Processed: {processed_count}/{total_groups} | ETA: {format_time(eta_seconds)}")
+            if processed_count > 0:
+                avg_time = elapsed / processed_count
+                remaining = total_groups - processed_count
+                eta_seconds = remaining * avg_time
+                percent = (processed_count / total_groups) * 100
+                log(f"⏳ Progress: {percent:.1f}% | Processed: {processed_count}/{total_groups} | ETA: {format_time(eta_seconds)}")
 
         if not DRY_RUN:
-            time.sleep(0.2) # Fast mode
+            time.sleep(1.0) # Safety buffer for live updates (1s = safe)
 
     total_time = time.time() - start_time
     log(f"🎉 CYCLE DONE! Processed {processed_count} groups in {format_time(total_time)}.")
@@ -207,15 +201,12 @@ threading.Thread(target=background_worker, daemon=True).start()
 # Flask Server
 @app.route('/')
 def home():
-    # Read the last few lines of the log file to show on the web page
     log_content = "No logs yet."
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'r') as f:
-            # Get last 20 lines
             lines = f.readlines()[-20:]
             log_content = "<br>".join(lines)
-            
-    return f"<h1>Merge Script Running</h1><pre>{log_content}</pre>", 200
+    return f"<h1>Merge Script Running (LIVE MODE)</h1><pre>{log_content}</pre>", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
