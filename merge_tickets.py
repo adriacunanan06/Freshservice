@@ -112,21 +112,24 @@ def merge_individually(primary_id, secondary_ids):
     success_count = 0
     
     for sec_id in secondary_ids:
-        payload = { "secondary_ticket_ids": [sec_id] }
+        # Correct Payload for Individual Merge using the Bulk Endpoint
+        payload = { 
+            "primary_id": primary_id,
+            "ticket_ids": [sec_id]
+        }
+        
         try:
-            res = requests.put(f"{BASE_URL}/tickets/{primary_id}/merge", auth=AUTH, headers=HEADERS, data=json.dumps(payload))
+            res = requests.put(f"{BASE_URL}/tickets/merge", auth=AUTH, headers=HEADERS, data=json.dumps(payload))
+            
             if check_rate_limit(res): 
-                # Retry once if rate limited
-                res = requests.put(f"{BASE_URL}/tickets/{primary_id}/merge", auth=AUTH, headers=HEADERS, data=json.dumps(payload))
+                res = requests.put(f"{BASE_URL}/tickets/merge", auth=AUTH, headers=HEADERS, data=json.dumps(payload))
 
             if res.status_code in [200, 204]:
                 success_count += 1
             else:
-                # Silently fail the individual bad ticket so we keep moving
-                pass 
+                pass # Silently skip bad ones
         except: pass
         
-        # Slight delay to avoid hammering
         time.sleep(0.5)
     
     if success_count > 0:
@@ -137,8 +140,14 @@ def merge_individually(primary_id, secondary_ids):
         return False
 
 def merge_tickets(primary_id, secondary_ids):
-    url = f"{BASE_URL}/tickets/{primary_id}/merge"
-    payload = { "secondary_ticket_ids": secondary_ids }
+    # --- CORRECT URL: PUT /tickets/merge ---
+    url = f"{BASE_URL}/tickets/merge"
+    
+    # --- CORRECT PAYLOAD (As provided by Freshdesk Support) ---
+    payload = {
+        "primary_id": primary_id,
+        "ticket_ids": secondary_ids
+    }
     
     if DRY_RUN: return True
             
@@ -151,8 +160,9 @@ def merge_tickets(primary_id, secondary_ids):
             log(f"✅ Merged {len(secondary_ids)} into #{primary_id}")
             return True
             
-        elif response.status_code == 404:
-            log(f"⚠️ Bulk merge failed (404). Diagnosing...")
+        elif response.status_code in [404, 400]:
+            # If 404 or 400, it means one of the tickets in the list is invalid/deleted.
+            log(f"⚠️ Bulk merge failed ({response.status_code}). Diagnosing...")
             
             # 1. Verify Primary Exists
             try:
@@ -162,20 +172,16 @@ def merge_tickets(primary_id, secondary_ids):
                     return False
             except: return False
 
-            # 2. Filter Secondaries (Smart Retry)
+            # 2. Filter Secondaries
             valid_secondary_ids = filter_valid_tickets(secondary_ids)
             
             if len(valid_secondary_ids) == 0:
                 log(f"   ❌ All secondary tickets are gone.")
                 return False
             
-            if len(valid_secondary_ids) < len(secondary_ids):
-                log(f"   🔄 Retrying with {len(valid_secondary_ids)} valid tickets...")
-                return merge_tickets(primary_id, valid_secondary_ids)
-            else:
-                # 3. Nuclear Option: Individual Merge
-                # If we are here, filters say they exist, but bulk merge fails.
-                return merge_individually(primary_id, valid_secondary_ids)
+            # 3. Nuclear Option: Merge whatever is left individually
+            # This handles cases where valid_secondary_ids still throws an error in bulk
+            return merge_individually(primary_id, valid_secondary_ids)
 
         else:
             log(f"❌ FAILED merge #{primary_id} | Status: {response.status_code} | Reason: {response.text}")
@@ -187,7 +193,7 @@ def merge_tickets(primary_id, secondary_ids):
 
 def run_merge_process():
     log("========================================")
-    log("STARTING MERGE PROCESS (NUCLEAR RETRY)")
+    log("STARTING MERGE PROCESS (OFFICIAL FIX)")
     log("========================================")
 
     processed_requesters = load_checkpoint()
@@ -256,7 +262,7 @@ def home():
     content = "No logs."
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'r') as f: content = "<br>".join(f.readlines()[-20:])
-    return f"<h1>Merge Script (Nuclear Retry)</h1><pre>{content}</pre>", 200
+    return f"<h1>Merge Script (OFFICIAL FIX)</h1><pre>{content}</pre>", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
