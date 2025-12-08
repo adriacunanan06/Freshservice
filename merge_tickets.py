@@ -12,7 +12,7 @@ import requests
 DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
 
-# 🚨 SAFETY SWITCH: FALSE = REAL MERGES 🚨
+# 🚨 SAFETY SWITCH: FALSE = REAL MERGES (DESTRUCTIVE) 🚨
 DRY_RUN = False  
 
 CHECKPOINT_FILE = "merge_checkpoint.json"
@@ -24,7 +24,7 @@ BASE_URL = f"https://{DOMAIN}/api/v2"
 AUTH = (API_KEY, "X")
 HEADERS = {"Content-Type": "application/json"}
 
-# --- SETUP LOGGING ---
+# --- SETUP LOGGING (File + Console) ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
@@ -78,7 +78,7 @@ def get_all_tickets():
             if check_rate_limit(response): continue
             
             if response.status_code != 200:
-                log(f"❌ Error fetching page {page}: {response.status_code} - {response.text}")
+                log(f"❌ Error fetching page {page}: {response.text}")
                 break
                 
             data = response.json()
@@ -96,21 +96,28 @@ def get_all_tickets():
     return all_tickets
 
 def merge_tickets(primary_id, secondary_ids):
-    url = f"{BASE_URL}/tickets/{primary_id}/merge"
-    payload = { "secondary_ticket_ids": secondary_ids }
+    # --- CRITICAL FIX: The Merge Endpoint is POST, not PUT ---
+    url = f"{BASE_URL}/tickets/merge" # Note: No ID in URL for bulk merge endpoint
+    
+    # Correct Payload Structure for POST /tickets/merge
+    payload = {
+        "primary_ticket_id": primary_id,
+        "secondary_ticket_ids": secondary_ids
+    }
     
     if DRY_RUN:
         return True
             
     try:
-        response = requests.put(url, auth=AUTH, headers=HEADERS, data=json.dumps(payload))
+        # Changed from PUT to POST
+        response = requests.post(url, auth=AUTH, headers=HEADERS, data=json.dumps(payload))
+        
         if check_rate_limit(response): return merge_tickets(primary_id, secondary_ids)
             
         if response.status_code in [200, 204]:
             log(f"✅ Merged {len(secondary_ids)} into #{primary_id}")
             return True
         else:
-            # UPDATED LOGGING TO SHOW STATUS CODE
             log(f"❌ FAILED merge #{primary_id} | Status: {response.status_code} | Reason: {response.text}")
             return False
     except Exception as e:
@@ -119,7 +126,7 @@ def merge_tickets(primary_id, secondary_ids):
 
 def run_merge_process():
     log("========================================")
-    log("STARTING TICKET MERGE PROCESS (DEBUG MODE)")
+    log("STARTING TICKET MERGE PROCESS (FIXED POST)")
     log(f"Mode: {'DRY RUN (Safe)' if DRY_RUN else 'LIVE (Destructive)'}")
     log("========================================")
 
@@ -207,7 +214,7 @@ def home():
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()[-20:]
             log_content = "<br>".join(lines)
-    return f"<h1>Merge Script Running (DEBUG MODE)</h1><pre>{log_content}</pre>", 200
+    return f"<h1>Merge Script Running (FIXED POST)</h1><pre>{log_content}</pre>", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
