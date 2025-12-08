@@ -95,18 +95,46 @@ def filter_valid_tickets(ticket_ids):
     valid_ids = []
     for tid in ticket_ids:
         try:
-            # lightweight check
             res = requests.get(f"{BASE_URL}/tickets/{tid}", auth=AUTH)
             if res.status_code == 200:
                 valid_ids.append(tid)
             elif res.status_code == 429:
                 check_rate_limit(res)
-                # Retry this specific ID check
                 res = requests.get(f"{BASE_URL}/tickets/{tid}", auth=AUTH)
                 if res.status_code == 200: valid_ids.append(tid)
         except:
             pass
     return valid_ids
+
+def merge_individually(primary_id, secondary_ids):
+    """Fallback: Tries to merge tickets one by one if the bulk merge fails."""
+    log(f"   🛡️ Starting INDIVIDUAL merge fallback for #{primary_id}...")
+    success_count = 0
+    
+    for sec_id in secondary_ids:
+        payload = { "secondary_ticket_ids": [sec_id] }
+        try:
+            res = requests.put(f"{BASE_URL}/tickets/{primary_id}/merge", auth=AUTH, headers=HEADERS, data=json.dumps(payload))
+            if check_rate_limit(res): 
+                # Retry once if rate limited
+                res = requests.put(f"{BASE_URL}/tickets/{primary_id}/merge", auth=AUTH, headers=HEADERS, data=json.dumps(payload))
+
+            if res.status_code in [200, 204]:
+                success_count += 1
+            else:
+                # Silently fail the individual bad ticket so we keep moving
+                pass 
+        except: pass
+        
+        # Slight delay to avoid hammering
+        time.sleep(0.5)
+    
+    if success_count > 0:
+        log(f"   ✅ Saved {success_count}/{len(secondary_ids)} tickets via individual merge.")
+        return True
+    else:
+        log(f"   ❌ All individual merges failed for #{primary_id}.")
+        return False
 
 def merge_tickets(primary_id, secondary_ids):
     url = f"{BASE_URL}/tickets/{primary_id}/merge"
@@ -124,32 +152,30 @@ def merge_tickets(primary_id, secondary_ids):
             return True
             
         elif response.status_code == 404:
-            # SMART RETRY LOGIC
-            log(f"⚠️ Merge failed (404). Checking for deleted tickets in group...")
+            log(f"⚠️ Bulk merge failed (404). Diagnosing...")
             
-            # 1. Verify Primary
+            # 1. Verify Primary Exists
             try:
                 p_check = requests.get(f"{BASE_URL}/tickets/{primary_id}", auth=AUTH)
                 if p_check.status_code == 404:
-                    log(f"   ❌ Primary Ticket #{primary_id} is gone. Cannot merge group.")
+                    log(f"   ❌ Primary Ticket #{primary_id} is gone. Aborting group.")
                     return False
             except: return False
 
-            # 2. Filter Secondaries
+            # 2. Filter Secondaries (Smart Retry)
             valid_secondary_ids = filter_valid_tickets(secondary_ids)
             
             if len(valid_secondary_ids) == 0:
-                log(f"   ❌ All secondary tickets are gone. Nothing to merge.")
+                log(f"   ❌ All secondary tickets are gone.")
                 return False
             
             if len(valid_secondary_ids) < len(secondary_ids):
-                log(f"   🔄 Found {len(valid_secondary_ids)} valid tickets (removed {len(secondary_ids) - len(valid_secondary_ids)} bad ones). Retrying...")
-                # RECURSIVE CALL with clean list
+                log(f"   🔄 Retrying with {len(valid_secondary_ids)} valid tickets...")
                 return merge_tickets(primary_id, valid_secondary_ids)
             else:
-                # If we are here, it means all tickets exist but 404 persists (very rare API glitch)
-                log(f"   ❌ Unknown 404 error. Skipping.")
-                return False
+                # 3. Nuclear Option: Individual Merge
+                # If we are here, filters say they exist, but bulk merge fails.
+                return merge_individually(primary_id, valid_secondary_ids)
 
         else:
             log(f"❌ FAILED merge #{primary_id} | Status: {response.status_code} | Reason: {response.text}")
@@ -161,7 +187,7 @@ def merge_tickets(primary_id, secondary_ids):
 
 def run_merge_process():
     log("========================================")
-    log("STARTING MERGE PROCESS (SMART RETRY)")
+    log("STARTING MERGE PROCESS (NUCLEAR RETRY)")
     log("========================================")
 
     processed_requesters = load_checkpoint()
@@ -230,7 +256,7 @@ def home():
     content = "No logs."
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'r') as f: content = "<br>".join(f.readlines()[-20:])
-    return f"<h1>Merge Script (Smart Retry)</h1><pre>{content}</pre>", 200
+    return f"<h1>Merge Script (Nuclear Retry)</h1><pre>{content}</pre>", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
