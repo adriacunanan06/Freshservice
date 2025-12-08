@@ -12,7 +12,7 @@ import requests
 DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
 
-# 🚨 SAFETY SWITCH: FALSE = REAL MERGES 🚨
+# 🚨 LIVE MODE 🚨
 DRY_RUN = False  
 
 CHECKPOINT_FILE = "merge_checkpoint.json"
@@ -24,7 +24,7 @@ BASE_URL = f"https://{DOMAIN}/api/v2"
 AUTH = (API_KEY, "X")
 HEADERS = {"Content-Type": "application/json"}
 
-# --- SETUP LOGGING ---
+# Logging Setup
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
@@ -46,21 +46,19 @@ def load_checkpoint():
             with open(CHECKPOINT_FILE, 'r') as f:
                 data = json.load(f)
             return set(data.get('processed_requesters', []))
-        except Exception as e:
-            log(f"Error loading checkpoint: {e}")
+        except: return set()
     return set()
 
 def save_checkpoint(processed_set):
     try:
         with open(CHECKPOINT_FILE, 'w') as f:
             json.dump({"processed_requesters": list(processed_set)}, f)
-    except Exception as e:
-        log(f"Error saving checkpoint: {e}")
+    except: pass
 
 def check_rate_limit(response):
     if response.status_code == 429:
         retry_after = int(response.headers.get("Retry-After", 60))
-        log(f"⚠️ Rate limit hit. Sleeping for {retry_after} seconds...")
+        log(f"⚠️ Rate limit hit. Sleeping for {retry_after}s...")
         time.sleep(retry_after + 5)
         return True
     return False
@@ -69,7 +67,7 @@ def get_all_tickets():
     all_tickets = []
     page = 1
     per_page = 100
-    log("📥 Fetching tickets from Freshdesk...")
+    log("📥 Fetching tickets...")
     
     while True:
         url = f"{BASE_URL}/tickets?per_page={per_page}&page={page}"
@@ -80,47 +78,41 @@ def get_all_tickets():
             if response.status_code != 200:
                 log(f"❌ Error fetching page {page}: {response.text}")
                 break
-                
+            
             data = response.json()
             if not data: break
             
             all_tickets.extend(data)
-            if page % 5 == 0:
-                log(f"   Fetched page {page}... Total so far: {len(all_tickets)}")
+            if page % 5 == 0: log(f"   Fetched {len(all_tickets)} tickets...")
             page += 1
-            
-        except Exception as e:
-            log(f"❌ Network error: {e}")
+        except:
             time.sleep(5)
             
     return all_tickets
 
-def verify_ticket_exists(ticket_id):
-    """Checks if a ticket exists before we try to mess with it."""
-    url = f"{BASE_URL}/tickets/{ticket_id}"
-    try:
-        response = requests.get(url, auth=AUTH)
-        if response.status_code == 200:
-            return True
-        elif response.status_code == 404:
-            return False
-    except:
-        return False
-    return False
+def filter_valid_tickets(ticket_ids):
+    """Checks a list of IDs and returns only the ones that exist."""
+    valid_ids = []
+    for tid in ticket_ids:
+        try:
+            # lightweight check
+            res = requests.get(f"{BASE_URL}/tickets/{tid}", auth=AUTH)
+            if res.status_code == 200:
+                valid_ids.append(tid)
+            elif res.status_code == 429:
+                check_rate_limit(res)
+                # Retry this specific ID check
+                res = requests.get(f"{BASE_URL}/tickets/{tid}", auth=AUTH)
+                if res.status_code == 200: valid_ids.append(tid)
+        except:
+            pass
+    return valid_ids
 
 def merge_tickets(primary_id, secondary_ids):
-    # --- CORRECT URL: PUT /tickets/[id]/merge ---
     url = f"{BASE_URL}/tickets/{primary_id}/merge"
     payload = { "secondary_ticket_ids": secondary_ids }
     
-    if DRY_RUN:
-        return True
-    
-    # 1. VERIFY PRIMARY EXISTS FIRST
-    # This prevents the 404 error from crashing the logic
-    if not verify_ticket_exists(primary_id):
-        log(f"⚠️ Skipping Merge: Primary Ticket #{primary_id} not found (deleted?).")
-        return False
+    if DRY_RUN: return True
             
     try:
         response = requests.put(url, auth=AUTH, headers=HEADERS, data=json.dumps(payload))
@@ -130,57 +122,74 @@ def merge_tickets(primary_id, secondary_ids):
         if response.status_code in [200, 204]:
             log(f"✅ Merged {len(secondary_ids)} into #{primary_id}")
             return True
+            
         elif response.status_code == 404:
-            log(f"⚠️ Merge Failed (404): One of the secondary tickets {secondary_ids} might be missing.")
-            return False
-        elif response.status_code == 400:
-            log(f"⚠️ Merge Failed (400): {response.text}")
-            return False
+            # SMART RETRY LOGIC
+            log(f"⚠️ Merge failed (404). Checking for deleted tickets in group...")
+            
+            # 1. Verify Primary
+            try:
+                p_check = requests.get(f"{BASE_URL}/tickets/{primary_id}", auth=AUTH)
+                if p_check.status_code == 404:
+                    log(f"   ❌ Primary Ticket #{primary_id} is gone. Cannot merge group.")
+                    return False
+            except: return False
+
+            # 2. Filter Secondaries
+            valid_secondary_ids = filter_valid_tickets(secondary_ids)
+            
+            if len(valid_secondary_ids) == 0:
+                log(f"   ❌ All secondary tickets are gone. Nothing to merge.")
+                return False
+            
+            if len(valid_secondary_ids) < len(secondary_ids):
+                log(f"   🔄 Found {len(valid_secondary_ids)} valid tickets (removed {len(secondary_ids) - len(valid_secondary_ids)} bad ones). Retrying...")
+                # RECURSIVE CALL with clean list
+                return merge_tickets(primary_id, valid_secondary_ids)
+            else:
+                # If we are here, it means all tickets exist but 404 persists (very rare API glitch)
+                log(f"   ❌ Unknown 404 error. Skipping.")
+                return False
+
         else:
             log(f"❌ FAILED merge #{primary_id} | Status: {response.status_code} | Reason: {response.text}")
             return False
+            
     except Exception as e:
         log(f"❌ Error merging: {e}")
         return False
 
 def run_merge_process():
     log("========================================")
-    log("STARTING TICKET MERGE PROCESS (ROBUST MODE)")
-    log(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}")
+    log("STARTING MERGE PROCESS (SMART RETRY)")
     log("========================================")
 
     processed_requesters = load_checkpoint()
-    
     tickets = get_all_tickets()
-    total_tickets = len(tickets)
-    log(f"📦 Total tickets: {total_tickets}")
+    log(f"📦 Total tickets: {len(tickets)}")
     
-    log("🔍 Grouping tickets...")
+    log("🔍 Grouping...")
     tickets_by_requester = defaultdict(list)
     for t in tickets:
-        tickets_by_requester[t['requester_id']].append({
-            'id': t['id'],
-            'created_at': t['created_at']
-        })
+        tickets_by_requester[t['requester_id']].append(t)
     
     work_list = []
     for requester_id, user_tickets in tickets_by_requester.items():
-        if str(requester_id) in processed_requesters or requester_id in processed_requesters:
-            continue
+        if str(requester_id) in processed_requesters or requester_id in processed_requesters: continue
         if len(user_tickets) < 2:
             processed_requesters.add(requester_id)
             continue
         work_list.append((requester_id, user_tickets))
 
-    total_groups = len(work_list)
-    log(f"🚀 Found {total_groups} groups to process.")
+    log(f"🚀 Found {len(work_list)} groups.")
     
     start_time = time.time()
     processed_count = 0
+    total_groups = len(work_list)
     
     for i, (requester_id, user_tickets) in enumerate(work_list):
-        
         user_tickets.sort(key=lambda x: x['created_at'])
+        
         primary = user_tickets[-1] 
         secondary_tickets = user_tickets[:-1]
         secondary_ids = [t['id'] for t in secondary_tickets]
@@ -196,38 +205,32 @@ def run_merge_process():
         if processed_count % 5 == 0: 
             elapsed = time.time() - start_time
             if processed_count > 0:
-                avg_time = elapsed / processed_count
-                remaining = total_groups - processed_count
-                eta_seconds = remaining * avg_time
-                percent = (processed_count / total_groups) * 100
-                log(f"⏳ Progress: {percent:.1f}% | Processed: {processed_count}/{total_groups} | ETA: {format_time(eta_seconds)}")
+                avg = elapsed / processed_count
+                rem = total_groups - processed_count
+                eta = rem * avg
+                pct = (processed_count / total_groups) * 100
+                log(f"⏳ Progress: {pct:.1f}% | Processed: {processed_count}/{total_groups} | ETA: {format_time(eta)}")
 
-        if not DRY_RUN:
-            time.sleep(1.0) 
+        if not DRY_RUN: time.sleep(1.0) 
 
-    total_time = time.time() - start_time
-    log(f"🎉 CYCLE DONE! Processed {processed_count} groups in {format_time(total_time)}.")
+    log(f"🎉 DONE! Processed {processed_count} groups.")
 
 def background_worker():
     while True:
         try:
             run_merge_process()
-            log("Sleeping for 60 minutes...")
+            log("Sleeping 60 mins...")
             time.sleep(3600) 
-        except Exception as e:
-            log(f"CRITICAL CRASH: {e}")
-            time.sleep(60)
+        except: time.sleep(60)
 
 threading.Thread(target=background_worker, daemon=True).start()
 
 @app.route('/')
 def home():
-    log_content = "No logs yet."
+    content = "No logs."
     if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'r') as f:
-            lines = f.readlines()[-20:]
-            log_content = "<br>".join(lines)
-    return f"<h1>Merge Script Running (Robust Mode)</h1><pre>{log_content}</pre>", 200
+        with open(LOG_FILE, 'r') as f: content = "<br>".join(f.readlines()[-20:])
+    return f"<h1>Merge Script (Smart Retry)</h1><pre>{content}</pre>", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
