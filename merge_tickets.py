@@ -12,7 +12,7 @@ import requests
 DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
 
-# 🚨 SAFETY SWITCH: FALSE = REAL MERGES (DESTRUCTIVE) 🚨
+# 🚨 SAFETY SWITCH: FALSE = REAL MERGES 🚨
 DRY_RUN = False  
 
 CHECKPOINT_FILE = "merge_checkpoint.json"
@@ -24,7 +24,7 @@ BASE_URL = f"https://{DOMAIN}/api/v2"
 AUTH = (API_KEY, "X")
 HEADERS = {"Content-Type": "application/json"}
 
-# --- SETUP LOGGING (File + Console) ---
+# --- SETUP LOGGING ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
@@ -78,7 +78,7 @@ def get_all_tickets():
             if check_rate_limit(response): continue
             
             if response.status_code != 200:
-                log(f"❌ Error fetching page {page}: {response.text}")
+                log(f"❌ Error fetching page {page}: {response.status_code} - {response.text}")
                 break
                 
             data = response.json()
@@ -110,7 +110,8 @@ def merge_tickets(primary_id, secondary_ids):
             log(f"✅ Merged {len(secondary_ids)} into #{primary_id}")
             return True
         else:
-            log(f"❌ FAILED merge #{primary_id}: {response.text}")
+            # UPDATED LOGGING TO SHOW STATUS CODE
+            log(f"❌ FAILED merge #{primary_id} | Status: {response.status_code} | Reason: {response.text}")
             return False
     except Exception as e:
         log(f"❌ Error merging: {e}")
@@ -118,7 +119,7 @@ def merge_tickets(primary_id, secondary_ids):
 
 def run_merge_process():
     log("========================================")
-    log("STARTING TICKET MERGE PROCESS")
+    log("STARTING TICKET MERGE PROCESS (DEBUG MODE)")
     log(f"Mode: {'DRY RUN (Safe)' if DRY_RUN else 'LIVE (Destructive)'}")
     log("========================================")
 
@@ -180,7 +181,7 @@ def run_merge_process():
                 log(f"⏳ Progress: {percent:.1f}% | Processed: {processed_count}/{total_groups} | ETA: {format_time(eta_seconds)}")
 
         if not DRY_RUN:
-            time.sleep(1.0) # Safety buffer for live updates (1s = safe)
+            time.sleep(1.0) 
 
     total_time = time.time() - start_time
     log(f"🎉 CYCLE DONE! Processed {processed_count} groups in {format_time(total_time)}.")
@@ -206,7 +207,7 @@ def home():
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()[-20:]
             log_content = "<br>".join(lines)
-    return f"<h1>Merge Script Running (LIVE MODE)</h1><pre>{log_content}</pre>", 200
+    return f"<h1>Merge Script Running (DEBUG MODE)</h1><pre>{log_content}</pre>", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
