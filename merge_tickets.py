@@ -96,28 +96,26 @@ def get_all_tickets():
     return all_tickets
 
 def merge_tickets(primary_id, secondary_ids):
-    # --- CORRECT COMBINATION: PUT /tickets/merge ---
-    url = f"{BASE_URL}/tickets/merge"
-    
-    # Payload must include BOTH primary and secondary IDs
-    payload = {
-        "primary_ticket_id": primary_id,
-        "secondary_ticket_ids": secondary_ids
-    }
+    # --- CORRECT URL: PUT /tickets/[id]/merge ---
+    # The payload is just the list of secondary IDs
+    url = f"{BASE_URL}/tickets/{primary_id}/merge"
+    payload = { "secondary_ticket_ids": secondary_ids }
     
     if DRY_RUN:
         return True
             
     try:
-        # Request uses PUT
         response = requests.put(url, auth=AUTH, headers=HEADERS, data=json.dumps(payload))
         
         if check_rate_limit(response): return merge_tickets(primary_id, secondary_ids)
             
-        # Freshdesk returns 204 No Content on success, or 200 OK
         if response.status_code in [200, 204]:
             log(f"✅ Merged {len(secondary_ids)} into #{primary_id}")
             return True
+        elif response.status_code == 404:
+            # 404 means one of the tickets is missing. We should SKIP it instead of crashing.
+            log(f"⚠️ Skip Merge #{primary_id}: Ticket not found (already deleted?).")
+            return False
         else:
             log(f"❌ FAILED merge #{primary_id} | Status: {response.status_code} | Reason: {response.text}")
             return False
@@ -127,8 +125,8 @@ def merge_tickets(primary_id, secondary_ids):
 
 def run_merge_process():
     log("========================================")
-    log("STARTING TICKET MERGE PROCESS (PUT /tickets/merge)")
-    log(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE (Destructive)'}")
+    log("STARTING TICKET MERGE PROCESS (HANDLING 404s)")
+    log(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}")
     log("========================================")
 
     processed_requesters = load_checkpoint()
@@ -209,7 +207,7 @@ def home():
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()[-20:]
             log_content = "<br>".join(lines)
-    return f"<h1>Merge Script (PUT /merge)</h1><pre>{log_content}</pre>", 200
+    return f"<h1>Merge Script (Handling 404s)</h1><pre>{log_content}</pre>", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
