@@ -12,7 +12,7 @@ import requests
 DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
 
-# 🚨 SAFETY SWITCH: FALSE = REAL MERGES (DESTRUCTIVE) 🚨
+# 🚨 SAFETY SWITCH: FALSE = REAL MERGES 🚨
 DRY_RUN = False  
 
 CHECKPOINT_FILE = "merge_checkpoint.json"
@@ -24,7 +24,7 @@ BASE_URL = f"https://{DOMAIN}/api/v2"
 AUTH = (API_KEY, "X")
 HEADERS = {"Content-Type": "application/json"}
 
-# --- SETUP LOGGING (File + Console) ---
+# --- SETUP LOGGING ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(message)s',
@@ -96,21 +96,25 @@ def get_all_tickets():
     return all_tickets
 
 def merge_tickets(primary_id, secondary_ids):
-    # --- CORRECT URL FOR MERGE: PUT /api/v2/tickets/[ID]/merge ---
-    url = f"{BASE_URL}/tickets/{primary_id}/merge"
+    # --- CORRECT COMBINATION: PUT /tickets/merge ---
+    url = f"{BASE_URL}/tickets/merge"
     
-    # Correct Payload
-    payload = { "secondary_ticket_ids": secondary_ids }
+    # Payload must include BOTH primary and secondary IDs
+    payload = {
+        "primary_ticket_id": primary_id,
+        "secondary_ticket_ids": secondary_ids
+    }
     
     if DRY_RUN:
         return True
             
     try:
-        # Reverted to PUT
+        # Request uses PUT
         response = requests.put(url, auth=AUTH, headers=HEADERS, data=json.dumps(payload))
         
         if check_rate_limit(response): return merge_tickets(primary_id, secondary_ids)
             
+        # Freshdesk returns 204 No Content on success, or 200 OK
         if response.status_code in [200, 204]:
             log(f"✅ Merged {len(secondary_ids)} into #{primary_id}")
             return True
@@ -123,18 +127,16 @@ def merge_tickets(primary_id, secondary_ids):
 
 def run_merge_process():
     log("========================================")
-    log("STARTING TICKET MERGE PROCESS (FIXED PUT)")
-    log(f"Mode: {'DRY RUN (Safe)' if DRY_RUN else 'LIVE (Destructive)'}")
+    log("STARTING TICKET MERGE PROCESS (PUT /tickets/merge)")
+    log(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE (Destructive)'}")
     log("========================================")
 
     processed_requesters = load_checkpoint()
     
-    # 1. Fetch
     tickets = get_all_tickets()
     total_tickets = len(tickets)
     log(f"📦 Total tickets: {total_tickets}")
     
-    # 2. Group
     log("🔍 Grouping tickets...")
     tickets_by_requester = defaultdict(list)
     for t in tickets:
@@ -143,7 +145,6 @@ def run_merge_process():
             'created_at': t['created_at']
         })
     
-    # 3. Prepare Work List
     work_list = []
     for requester_id, user_tickets in tickets_by_requester.items():
         if str(requester_id) in processed_requesters or requester_id in processed_requesters:
@@ -156,7 +157,6 @@ def run_merge_process():
     total_groups = len(work_list)
     log(f"🚀 Found {total_groups} groups to process.")
     
-    # 4. Process with ETA
     start_time = time.time()
     processed_count = 0
     
@@ -200,10 +200,8 @@ def background_worker():
             log(f"CRITICAL CRASH: {e}")
             time.sleep(60)
 
-# Start Background Thread
 threading.Thread(target=background_worker, daemon=True).start()
 
-# Flask Server
 @app.route('/')
 def home():
     log_content = "No logs yet."
@@ -211,7 +209,7 @@ def home():
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()[-20:]
             log_content = "<br>".join(lines)
-    return f"<h1>Merge Script Running (FIXED PUT)</h1><pre>{log_content}</pre>", 200
+    return f"<h1>Merge Script (PUT /merge)</h1><pre>{log_content}</pre>", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
