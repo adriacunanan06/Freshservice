@@ -95,14 +95,32 @@ def get_all_tickets():
             
     return all_tickets
 
+def verify_ticket_exists(ticket_id):
+    """Checks if a ticket exists before we try to mess with it."""
+    url = f"{BASE_URL}/tickets/{ticket_id}"
+    try:
+        response = requests.get(url, auth=AUTH)
+        if response.status_code == 200:
+            return True
+        elif response.status_code == 404:
+            return False
+    except:
+        return False
+    return False
+
 def merge_tickets(primary_id, secondary_ids):
     # --- CORRECT URL: PUT /tickets/[id]/merge ---
-    # The payload is just the list of secondary IDs
     url = f"{BASE_URL}/tickets/{primary_id}/merge"
     payload = { "secondary_ticket_ids": secondary_ids }
     
     if DRY_RUN:
         return True
+    
+    # 1. VERIFY PRIMARY EXISTS FIRST
+    # This prevents the 404 error from crashing the logic
+    if not verify_ticket_exists(primary_id):
+        log(f"⚠️ Skipping Merge: Primary Ticket #{primary_id} not found (deleted?).")
+        return False
             
     try:
         response = requests.put(url, auth=AUTH, headers=HEADERS, data=json.dumps(payload))
@@ -113,8 +131,10 @@ def merge_tickets(primary_id, secondary_ids):
             log(f"✅ Merged {len(secondary_ids)} into #{primary_id}")
             return True
         elif response.status_code == 404:
-            # 404 means one of the tickets is missing. We should SKIP it instead of crashing.
-            log(f"⚠️ Skip Merge #{primary_id}: Ticket not found (already deleted?).")
+            log(f"⚠️ Merge Failed (404): One of the secondary tickets {secondary_ids} might be missing.")
+            return False
+        elif response.status_code == 400:
+            log(f"⚠️ Merge Failed (400): {response.text}")
             return False
         else:
             log(f"❌ FAILED merge #{primary_id} | Status: {response.status_code} | Reason: {response.text}")
@@ -125,7 +145,7 @@ def merge_tickets(primary_id, secondary_ids):
 
 def run_merge_process():
     log("========================================")
-    log("STARTING TICKET MERGE PROCESS (HANDLING 404s)")
+    log("STARTING TICKET MERGE PROCESS (ROBUST MODE)")
     log(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE'}")
     log("========================================")
 
@@ -207,7 +227,7 @@ def home():
         with open(LOG_FILE, 'r') as f:
             lines = f.readlines()[-20:]
             log_content = "<br>".join(lines)
-    return f"<h1>Merge Script (Handling 404s)</h1><pre>{log_content}</pre>", 200
+    return f"<h1>Merge Script Running (Robust Mode)</h1><pre>{log_content}</pre>", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
