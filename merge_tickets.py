@@ -3,26 +3,20 @@ import time
 import json
 import logging
 import os
+import datetime
 from collections import defaultdict
 from flask import Flask
 import requests
 
-# ================= CONFIGURATION (SAFE MODE) =================
-# We read these from the Cloud Server settings
-DOMAIN = os.environ.get("FRESHDESK_DOMAIN") 
+# ================= CONFIGURATION =================
+DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
 
-# Hardcoded logic is fine, but keys must be hidden
-ACTORA_SENDER_ID = 159009728889 
-SHOPIFY_SENDER_ID = 159009730069
-IGNORE_EMAILS = [
-    "actorahelp@gmail.com", "customerservice@actorasupport.com",
-    "mailer@shopify.com", "no-reply@shopify.com",
-    "notifications@shopify.com", "support@actorasupport.com"
-]
-# SAFETY SWITCH
+# Set to False to ACTUALLY merge tickets
 DRY_RUN = True  
+
 CHECKPOINT_FILE = "merge_checkpoint.json"
+LOG_FILE = "merge_tickets.log"
 # =================================================
 
 app = Flask(__name__)
@@ -30,9 +24,22 @@ BASE_URL = f"https://{DOMAIN}/api/v2"
 AUTH = (API_KEY, "X")
 HEADERS = {"Content-Type": "application/json"}
 
-# Use standard print for logs on Render (it captures stdout)
+# --- SETUP LOGGING (File + Console) ---
+# This saves logs to 'merge_tickets.log' AND prints to the screen
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+
 def log(msg):
-    print(f"[LOG] {msg}")
+    logging.info(msg)
+
+def format_time(seconds):
+    return str(datetime.timedelta(seconds=int(seconds)))
 
 def load_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
@@ -55,7 +62,7 @@ def check_rate_limit(response):
     if response.status_code == 429:
         retry_after = int(response.headers.get("Retry-After", 60))
         log(f"⚠️ Rate limit hit. Sleeping for {retry_after} seconds...")
-        time.sleep(retry_after + 2)
+        time.sleep(retry_after + 5)
         return True
     return False
 
@@ -79,7 +86,7 @@ def get_all_tickets():
             if not data: break
             
             all_tickets.extend(data)
-            if page % 5 == 0: # Log every 5 pages to reduce noise
+            if page % 5 == 0:
                 log(f"   Fetched page {page}... Total so far: {len(all_tickets)}")
             page += 1
             
@@ -94,99 +101,122 @@ def merge_tickets(primary_id, secondary_ids):
     payload = { "secondary_ticket_ids": secondary_ids }
     
     if DRY_RUN:
-        log(f"   [DRY RUN] Would merge {len(secondary_ids)} tickets ({secondary_ids}) INTO -> #{primary_id}")
+        # log(f"   [DRY RUN] Would merge {len(secondary_ids)} tickets") # Reduced noise
         return True
             
     try:
         response = requests.put(url, auth=AUTH, headers=HEADERS, data=json.dumps(payload))
-        if check_rate_limit(response): return merge_tickets(primary_id, secondary_ids) # Retry
+        if check_rate_limit(response): return merge_tickets(primary_id, secondary_ids)
             
         if response.status_code in [200, 204]:
-            log(f"✅ SUCCESS: Merged {len(secondary_ids)} tickets INTO -> #{primary_id}")
+            log(f"✅ Merged {len(secondary_ids)} into #{primary_id}")
             return True
         else:
-            log(f"❌ FAILED to merge into #{primary_id}: {response.text}")
+            log(f"❌ FAILED merge #{primary_id}: {response.text}")
             return False
     except Exception as e:
-        log(f"❌ Error during merge request: {e}")
+        log(f"❌ Error merging: {e}")
         return False
 
 def run_merge_process():
-    """Main Logic Loop"""
     log("========================================")
     log("STARTING TICKET MERGE PROCESS")
     log(f"Mode: {'DRY RUN (Safe)' if DRY_RUN else 'LIVE (Destructive)'}")
     log("========================================")
 
     processed_requesters = load_checkpoint()
-    if processed_requesters:
-        log(f"🔄 Checkpoint found! Skipping {len(processed_requesters)} requesters.")
-
+    
+    # 1. Fetch
     tickets = get_all_tickets()
-    log(f"📦 Total tickets fetched: {len(tickets)}")
+    total_tickets = len(tickets)
+    log(f"📦 Total tickets: {total_tickets}")
     
-    log("🔍 Grouping tickets by requester...")
+    # 2. Group
+    log("🔍 Grouping tickets...")
     tickets_by_requester = defaultdict(list)
-    
     for t in tickets:
         tickets_by_requester[t['requester_id']].append({
             'id': t['id'],
             'created_at': t['created_at']
         })
-        
-    log(f"   Found {len(tickets_by_requester)} unique requesters.")
-    log("🚀 Starting Merge Process (Oldest -> Newest)...")
     
-    merge_count = 0
-    
+    # 3. Prepare Work List
+    work_list = []
     for requester_id, user_tickets in tickets_by_requester.items():
+        # Skip if done or not enough tickets
         if str(requester_id) in processed_requesters or requester_id in processed_requesters:
             continue
-
         if len(user_tickets) < 2:
             processed_requesters.add(requester_id)
-            continue 
-            
-        user_tickets.sort(key=lambda x: x['created_at'])
+            continue
+        work_list.append((requester_id, user_tickets))
+
+    total_groups = len(work_list)
+    log(f"🚀 Found {total_groups} groups to process.")
+    
+    # 4. Process with ETA
+    start_time = time.time()
+    processed_count = 0
+    
+    for i, (requester_id, user_tickets) in enumerate(work_list):
         
+        # Sort & Identify
+        user_tickets.sort(key=lambda x: x['created_at'])
         primary = user_tickets[-1] 
         secondary_tickets = user_tickets[:-1]
         secondary_ids = [t['id'] for t in secondary_tickets]
         
-        log(f"➡️ Processing Requester {requester_id}: Found {len(user_tickets)} tickets.")
-        
+        # Perform Merge
         success = merge_tickets(primary['id'], secondary_ids)
         
         if success:
-            merge_count += 1
             processed_requesters.add(requester_id)
             save_checkpoint(processed_requesters)
         
-        if not DRY_RUN:
-            time.sleep(1)
+        processed_count += 1
+        
+        # --- ETA CALCULATION ---
+        if processed_count % 5 == 0: # Update stats every 5 groups
+            elapsed = time.time() - start_time
+            avg_time = elapsed / processed_count
+            remaining = total_groups - processed_count
+            eta_seconds = remaining * avg_time
+            
+            percent = (processed_count / total_groups) * 100
+            log(f"⏳ Progress: {percent:.1f}% | Processed: {processed_count}/{total_groups} | ETA: {format_time(eta_seconds)}")
 
-    log(f"🎉 CYCLE DONE! Merged {merge_count} groups.")
+        if not DRY_RUN:
+            time.sleep(0.2) # Fast mode
+
+    total_time = time.time() - start_time
+    log(f"🎉 CYCLE DONE! Processed {processed_count} groups in {format_time(total_time)}.")
 
 def background_worker():
-    """Runs the merge process every 60 minutes so it keeps checking forever."""
     while True:
         try:
             run_merge_process()
-            log("Sleeping for 60 minutes before next check...")
+            log("Sleeping for 60 minutes...")
             time.sleep(3600) 
         except Exception as e:
-            log(f"CRITICAL WORKER CRASH: {e}")
+            log(f"CRITICAL CRASH: {e}")
             time.sleep(60)
 
-# Start the background thread
+# Start Background Thread
 threading.Thread(target=background_worker, daemon=True).start()
 
-# Web Server Route (Required for Render)
+# Flask Server
 @app.route('/')
 def home():
-    return "Merge Script is Running in Background!", 200
+    # Read the last few lines of the log file to show on the web page
+    log_content = "No logs yet."
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'r') as f:
+            # Get last 20 lines
+            lines = f.readlines()[-20:]
+            log_content = "<br>".join(lines)
+            
+    return f"<h1>Merge Script Running</h1><pre>{log_content}</pre>", 200
 
 if __name__ == "__main__":
-    # Render sets the PORT environment variable
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
