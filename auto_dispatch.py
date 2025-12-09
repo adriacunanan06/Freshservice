@@ -11,7 +11,13 @@ import requests
 DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
 
-# We will find this automatically now!
+# The 3 Agents we trust (Jean, Lance, Vanesa)
+AGENT_IDS = [
+    159009628844, 
+    159009628874, 
+    159009628889
+]
+
 TARGET_GROUP_NAME = "Agents" 
 SHOPIFY_SENDER_ID = 159009730069
 
@@ -33,7 +39,7 @@ HEADERS = {"Content-Type": "application/json"}
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 def log(msg): logging.info(msg)
 
-# Global variable to store the found ID
+# Global Cache
 CACHED_GROUP_ID = None
 
 def check_rate_limit(response):
@@ -49,7 +55,7 @@ def get_group_id():
     global CACHED_GROUP_ID
     if CACHED_GROUP_ID: return CACHED_GROUP_ID
     
-    log(f"🔎 Looking for Group ID for '{TARGET_GROUP_NAME}'...")
+    # log(f"🔎 Looking for Group ID for '{TARGET_GROUP_NAME}'...")
     try:
         res = requests.get(f"{BASE_URL}/groups", auth=AUTH)
         if res.status_code == 200:
@@ -57,11 +63,36 @@ def get_group_id():
             for g in groups:
                 if g['name'].lower() == TARGET_GROUP_NAME.lower():
                     CACHED_GROUP_ID = g['id']
-                    log(f"   ✅ Found Group '{g['name']}' -> ID: {CACHED_GROUP_ID}")
+                    # log(f"   ✅ Found Group '{g['name']}' -> ID: {CACHED_GROUP_ID}")
                     return CACHED_GROUP_ID
-            log(f"   ❌ Could not find a group named '{TARGET_GROUP_NAME}'")
-    except Exception as e: log(f"Group Fetch Error: {e}")
+    except: pass
     return None
+
+# --- AGENT AVAILABILITY CHECKER ---
+def get_active_agents():
+    """
+    Checks the specific 3 agents to see who is actually 'Available'.
+    """
+    active_list = []
+    # log("🔎 Checking Agent Availability...")
+    
+    for agent_id in AGENT_IDS:
+        try:
+            res = requests.get(f"{BASE_URL}/agents/{agent_id}", auth=AUTH)
+            if res.status_code == 200:
+                data = res.json()
+                name = data['contact']['name']
+                is_available = data.get('available', False)
+                
+                if is_available:
+                    # log(f"   🟢 {name} is ONLINE.")
+                    active_list.append(agent_id)
+                else:
+                    # log(f"   🔴 {name} is AWAY/OFFLINE.")
+                    pass
+        except: pass
+        
+    return active_list
 
 # --- HELPERS ---
 def find_best_email(body_text):
@@ -109,26 +140,11 @@ def merge_tickets(primary_id, secondary_ids):
         if res.status_code in [200, 204]:
             log(f"   ⚡ Instant Merge: {secondary_ids} into #{primary_id}")
             return True
-    except Exception as e: log(f"Merge Err: {e}")
+    except: pass
     return False
 
-def get_available_agents():
-    group_id = get_group_id()
-    if not group_id: return []
-    
-    all_agents = []
-    try:
-        res = requests.get(f"{BASE_URL}/groups/{group_id}/agents", auth=AUTH)
-        if res.status_code == 200:
-            for a in res.json():
-                all_agents.append(a['id'])
-        else:
-            log(f"❌ Failed to fetch agents: {res.status_code}")
-    except: pass
-    return all_agents
-
 # --- CORE LOGIC ---
-def process_single_ticket(ticket_object, active_agents=None):
+def process_single_ticket(ticket_object):
     t_id = ticket_object['id']
     
     # 1. FIX REQUESTER
@@ -156,24 +172,43 @@ def process_single_ticket(ticket_object, active_agents=None):
                         t_id = primary['id']
     except Exception as e: log(f"Merge Error: {e}")
 
-    # 3. ASSIGN
-    if not active_agents: active_agents = get_available_agents()
-    
-    if not active_agents:
-        return # Cannot assign if no agents found
-
+    # 3. ASSIGN (Check Availability First)
     current_responder = ticket_object.get('responder_id')
+    
+    # Get the "Agents" Group ID to enforce grouping
+    group_id = get_group_id()
+    
+    # Who is online RIGHT NOW?
+    active_agents = get_active_agents()
+    
     should_assign = False
     
-    if current_responder is None: should_assign = True
-    elif current_responder not in active_agents: should_assign = True
+    # If unassigned OR assigned to someone who is currently OFFLINE
+    if current_responder is None: 
+        should_assign = True
+    elif current_responder not in active_agents:
+        # If the assigned person went offline, we reassign (optional, but requested "available only")
+        # should_assign = True 
+        # Actually, let's only reassign if they are NOT in the allowed list at all
+        # Or if you want strict "Only Available" enforcement:
+        if current_responder in AGENT_IDS and current_responder not in active_agents:
+             # They are one of our 3, but they are offline.
+             # Strict mode: Reassign to someone online.
+             should_assign = True
     
     if should_assign:
-        import random
-        target = random.choice(active_agents)
-        if not DRY_RUN:
-            requests.put(f"{BASE_URL}/tickets/{t_id}", auth=AUTH, headers=HEADERS, json={"responder_id": target})
-            log(f"   👮 Assigned #{t_id} -> Agent {target}")
+        if active_agents:
+            import random
+            target = random.choice(active_agents)
+            if not DRY_RUN:
+                payload = { "responder_id": target }
+                # Force the group ID if we know it
+                if group_id: payload["group_id"] = int(group_id)
+                
+                requests.put(f"{BASE_URL}/tickets/{t_id}", auth=AUTH, headers=HEADERS, json=payload)
+                log(f"   👮 Assigned #{t_id} -> Agent {target} (Group: Agents)")
+        else:
+             log(f"   ⚠️ Cannot assign #{t_id}: All 3 agents are currently OFFLINE.")
 
 # --- WEBHOOK ---
 @app.route('/webhook', methods=['POST'])
@@ -191,19 +226,17 @@ def webhook():
 
 # --- SWEEPER ---
 def run_backlog_sweep():
-    log("🧹 STARTING BACKLOG SWEEP...")
+    log("🧹 STARTING BACKLOG SWEEP (Old & New Tickets)...")
+    
     group_id = get_group_id()
     if not group_id: 
-        log("❌ Cannot sweep: Group 'Agents' not found.")
+        log("❌ Critical: Cannot find group 'Agents'. Retrying later.")
         return
 
-    active_agents = get_available_agents()
-    if not active_agents:
-        log("⚠️ No agents found. Script will only Fix & Merge.")
-
     page = 1
-    # Use the dynamic Group ID here
+    # Fetch ALL Open/Pending tickets in the 'Agents' group
     query = f"group_id:{group_id} AND (status:2 OR status:3)"
+    
     while True:
         try:
             res = requests.get(f"{BASE_URL}/search/tickets?query=\"{query}\"&page={page}", auth=AUTH)
@@ -213,7 +246,7 @@ def run_backlog_sweep():
             if not tickets: break
             log(f"   🔎 Sweeping Batch {page}: {len(tickets)} tickets...")
             for ticket in tickets:
-                process_single_ticket(ticket, active_agents)
+                process_single_ticket(ticket)
                 time.sleep(0.2)
             if len(tickets) < 30: break 
             page += 1
@@ -232,7 +265,7 @@ threading.Thread(target=background_worker, daemon=True).start()
 
 @app.route('/')
 def home():
-    return "Auto-Dispatcher (DYNAMIC GROUP MODE) Running", 200
+    return "Auto-Dispatcher (AVAILABLE AGENTS ONLY) Running", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
