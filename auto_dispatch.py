@@ -11,9 +11,8 @@ import requests
 DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
 
-# Group ID for "Agents"
-TARGET_GROUP_ID = 159000817198
-# Shopify System User ID
+# We will find this automatically now!
+TARGET_GROUP_NAME = "Agents" 
 SHOPIFY_SENDER_ID = 159009730069
 
 IGNORE_EMAILS = [
@@ -34,6 +33,9 @@ HEADERS = {"Content-Type": "application/json"}
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 def log(msg): logging.info(msg)
 
+# Global variable to store the found ID
+CACHED_GROUP_ID = None
+
 def check_rate_limit(response):
     if response.status_code == 429:
         retry = int(response.headers.get("Retry-After", 60))
@@ -42,7 +44,26 @@ def check_rate_limit(response):
         return True
     return False
 
-# --- HELPER FUNCTIONS ---
+# --- DYNAMIC GROUP LOOKUP ---
+def get_group_id():
+    global CACHED_GROUP_ID
+    if CACHED_GROUP_ID: return CACHED_GROUP_ID
+    
+    log(f"🔎 Looking for Group ID for '{TARGET_GROUP_NAME}'...")
+    try:
+        res = requests.get(f"{BASE_URL}/groups", auth=AUTH)
+        if res.status_code == 200:
+            groups = res.json()
+            for g in groups:
+                if g['name'].lower() == TARGET_GROUP_NAME.lower():
+                    CACHED_GROUP_ID = g['id']
+                    log(f"   ✅ Found Group '{g['name']}' -> ID: {CACHED_GROUP_ID}")
+                    return CACHED_GROUP_ID
+            log(f"   ❌ Could not find a group named '{TARGET_GROUP_NAME}'")
+    except Exception as e: log(f"Group Fetch Error: {e}")
+    return None
+
+# --- HELPERS ---
 def find_best_email(body_text):
     if not body_text: return None
     candidates = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', body_text)
@@ -81,7 +102,6 @@ def fix_requester_if_needed(ticket):
 def merge_tickets(primary_id, secondary_ids):
     if DRY_RUN or not secondary_ids: return False
     url = f"{BASE_URL}/tickets/merge"
-    # CORRECT PAYLOAD (Confirmed by Support)
     payload = { "primary_id": primary_id, "ticket_ids": secondary_ids }
     try:
         res = requests.put(url, auth=AUTH, headers=HEADERS, data=json.dumps(payload))
@@ -89,42 +109,32 @@ def merge_tickets(primary_id, secondary_ids):
         if res.status_code in [200, 204]:
             log(f"   ⚡ Instant Merge: {secondary_ids} into #{primary_id}")
             return True
-    except: pass
+    except Exception as e: log(f"Merge Err: {e}")
     return False
 
 def get_available_agents():
-    """
-    Fetches agents. If none are explicitly 'Available' (toggle missing),
-    it falls back to 'All Agents in Group'.
-    """
-    all_agents = []
-    available_agents = []
+    group_id = get_group_id()
+    if not group_id: return []
     
+    all_agents = []
     try:
-        res = requests.get(f"{BASE_URL}/groups/{TARGET_GROUP_ID}/agents", auth=AUTH)
+        res = requests.get(f"{BASE_URL}/groups/{group_id}/agents", auth=AUTH)
         if res.status_code == 200:
             for a in res.json():
                 all_agents.append(a['id'])
-                if a.get("available", False): 
-                    available_agents.append(a['id'])
+        else:
+            log(f"❌ Failed to fetch agents: {res.status_code}")
     except: pass
-
-    if available_agents:
-        return available_agents
-    else:
-        # FALLBACK: If API says nobody is online (because toggle is missing),
-        # assume EVERYONE is working and return the full list.
-        if all_agents:
-            # log(f"   ⚠️ No 'Available' status found. Using FORCE MODE: Distributing to all {len(all_agents)} agents.")
-            return all_agents
-        return []
+    return all_agents
 
 # --- CORE LOGIC ---
 def process_single_ticket(ticket_object, active_agents=None):
     t_id = ticket_object['id']
+    
+    # 1. FIX REQUESTER
     real_req_id = fix_requester_if_needed(ticket_object)
     
-    # MERGE CHECK
+    # 2. MERGE CHECK
     query = f"requester_id:{real_req_id} AND (status:2 OR status:3)"
     try:
         res = requests.get(f"{BASE_URL}/search/tickets?query=\"{query}\"", auth=AUTH)
@@ -140,22 +150,25 @@ def process_single_ticket(ticket_object, active_agents=None):
                 
                 if merge_tickets(primary['id'], secondary):
                     if t_id in secondary:
-                        log(f"   🛑 Ticket #{t_id} merged/deleted. Done.")
+                        log(f"   🛑 Ticket #{t_id} merged. Done.")
                         return 
                     else:
                         t_id = primary['id']
     except Exception as e: log(f"Merge Error: {e}")
 
-    # ASSIGNMENT
+    # 3. ASSIGN
     if not active_agents: active_agents = get_available_agents()
     
+    if not active_agents:
+        return # Cannot assign if no agents found
+
     current_responder = ticket_object.get('responder_id')
     should_assign = False
     
     if current_responder is None: should_assign = True
     elif current_responder not in active_agents: should_assign = True
     
-    if should_assign and active_agents:
+    if should_assign:
         import random
         target = random.choice(active_agents)
         if not DRY_RUN:
@@ -179,13 +192,18 @@ def webhook():
 # --- SWEEPER ---
 def run_backlog_sweep():
     log("🧹 STARTING BACKLOG SWEEP...")
-    active_agents = get_available_agents()
-    if not active_agents: 
-        log("⚠️ CRITICAL: No agents found in group at all!")
+    group_id = get_group_id()
+    if not group_id: 
+        log("❌ Cannot sweep: Group 'Agents' not found.")
         return
 
+    active_agents = get_available_agents()
+    if not active_agents:
+        log("⚠️ No agents found. Script will only Fix & Merge.")
+
     page = 1
-    query = f"group_id:{TARGET_GROUP_ID} AND (status:2 OR status:3)"
+    # Use the dynamic Group ID here
+    query = f"group_id:{group_id} AND (status:2 OR status:3)"
     while True:
         try:
             res = requests.get(f"{BASE_URL}/search/tickets?query=\"{query}\"&page={page}", auth=AUTH)
@@ -214,7 +232,7 @@ threading.Thread(target=background_worker, daemon=True).start()
 
 @app.route('/')
 def home():
-    return "Auto-Dispatcher (FORCE MODE) Running", 200
+    return "Auto-Dispatcher (DYNAMIC GROUP MODE) Running", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
