@@ -9,18 +9,12 @@ from datetime import datetime
 from flask import Flask, request
 import requests
 
-# ================= CONFIGURATION =================
-# 1. Try to get keys from Environment (Render)
+# ================= PRODUCTION CONFIGURATION =================
 FD_DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 FD_API_KEY = os.environ.get("FRESHDESK_API_KEY")
 CLOCK_API_KEY = os.environ.get("CLOCKIFY_API_KEY")
 
-# 2. Fallback to Hardcoded Keys (Local Testing)
-if not FD_DOMAIN: FD_DOMAIN = "actorasupport.freshdesk.com"
-if not FD_API_KEY: FD_API_KEY = "nToPJRmvqzHHWJ6pib36"
-if not CLOCK_API_KEY: CLOCK_API_KEY = "MWFlZWY4MDctYWE5Zi00NDFkLWE1ODItMzg5OGQ0MmYwY2Uy"
-
-# Agents
+# AGENT LIST (Cyril, Jean, Lance, Vanesa)
 AGENT_IDS = [
     159009628895, # Cyril Poche
     159009628844, # Jean Kreanne Dawatan
@@ -28,7 +22,6 @@ AGENT_IDS = [
     159009628889  # Vanesa Joy Roble
 ]
 
-TARGET_GROUP_NAME = "Agents" 
 SHOPIFY_SENDER_ID = 159009730069
 
 IGNORE_EMAILS = [
@@ -38,7 +31,7 @@ IGNORE_EMAILS = [
 ]
 
 DRY_RUN = False  
-# =======================================================
+# ============================================================
 
 app = Flask(__name__)
 FD_BASE_URL = f"https://{FD_DOMAIN}/api/v2"
@@ -46,28 +39,38 @@ FD_AUTH = (FD_API_KEY, "X")
 FD_HEADERS = {"Content-Type": "application/json"}
 CLOCK_HEADERS = {"X-Api-Key": CLOCK_API_KEY}
 
-# GLOBAL QUEUE (The Waiting Line)
+# GLOBAL QUEUE
 TICKET_QUEUE = queue.Queue()
+RATE_LIMIT_UNTIL = 0
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 def log(msg): logging.info(msg)
 
-CACHED_GROUP_ID = None
 CACHED_WORKSPACE_ID = None
 CACHED_CLOCKIFY_MAP = {} 
 
-def check_rate_limit(response):
+# --- RATE LIMIT HANDLER ---
+def handle_rate_limits(response):
+    global RATE_LIMIT_UNTIL
     if response.status_code == 429:
         retry = int(response.headers.get("Retry-After", 60))
-        log(f"⚠️ Rate limit hit. Pausing worker for {retry}s...")
-        time.sleep(retry + 5)
+        RATE_LIMIT_UNTIL = time.time() + retry + 5
+        log(f"⚠️ RATE LIMIT HIT! Pausing for {retry}s...")
         return True
     return False
+
+def wait_if_limited():
+    remaining = RATE_LIMIT_UNTIL - time.time()
+    if remaining > 0: time.sleep(remaining)
 
 # --- CLOCKIFY LOGIC ---
 def init_clockify():
     global CACHED_WORKSPACE_ID
-    # log("🔑 Authenticating with Clockify...")
+    if not CLOCK_API_KEY:
+        log("❌ Clockify Key Missing!")
+        return False
+
+    wait_if_limited()
     try:
         res = requests.get("https://api.clockify.me/api/v1/user", headers=CLOCK_HEADERS)
         if res.status_code == 200:
@@ -85,6 +88,7 @@ def build_clockify_cache():
     if not CACHED_WORKSPACE_ID:
         if not init_clockify(): return
 
+    wait_if_limited()
     try:
         res = requests.get(f"https://api.clockify.me/api/v1/workspaces/{CACHED_WORKSPACE_ID}/users", headers=CLOCK_HEADERS)
         if res.status_code == 200:
@@ -100,26 +104,28 @@ def is_user_clocked_in(email):
     
     ws_id = CACHED_WORKSPACE_ID
     user_id = CACHED_CLOCKIFY_MAP[email]
+    
+    wait_if_limited()
     try:
         url = f"https://api.clockify.me/api/v1/workspaces/{ws_id}/user/{user_id}/time-entries?in-progress=true"
         res = requests.get(url, headers=CLOCK_HEADERS)
         if res.status_code == 200:
             entries = res.json()
             if len(entries) > 0:
-                start_time = entries[0].get('timeInterval', {}).get('start', 'Unknown')
-                # log(f"      🟢 {email} is ONLINE (Started: {start_time})")
                 return True
     except: pass
     return False
 
 def get_active_agents_via_clockify():
     active_list = []
-    # Refresh cache occasionally or if empty
     if not CACHED_CLOCKIFY_MAP: build_clockify_cache()
     
     for agent_id in AGENT_IDS:
+        wait_if_limited()
         try:
             res = requests.get(f"{FD_BASE_URL}/agents/{agent_id}", auth=FD_AUTH)
+            if handle_rate_limits(res): continue
+            
             if res.status_code == 200:
                 primary_email = res.json()['contact']['email']
                 is_active = is_user_clocked_in(primary_email)
@@ -134,19 +140,6 @@ def get_active_agents_via_clockify():
     return active_list
 
 # --- FRESHDESK HELPERS ---
-def get_group_id():
-    global CACHED_GROUP_ID
-    if CACHED_GROUP_ID: return CACHED_GROUP_ID
-    try:
-        res = requests.get(f"{FD_BASE_URL}/groups", auth=FD_AUTH)
-        if res.status_code == 200:
-            for g in res.json():
-                if g['name'].lower() == TARGET_GROUP_NAME.lower():
-                    CACHED_GROUP_ID = g['id']
-                    return CACHED_GROUP_ID
-    except: pass
-    return None
-
 def find_best_email(body_text):
     if not body_text: return None
     candidates = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', body_text)
@@ -155,11 +148,16 @@ def find_best_email(body_text):
     return None
 
 def get_or_create_contact(email):
+    wait_if_limited()
     try:
         res = requests.get(f"{FD_BASE_URL}/contacts?email={email}", auth=FD_AUTH)
+        if handle_rate_limits(res): return None
         if res.status_code == 200 and len(res.json()) > 0: return res.json()[0]['id']
+        
         if not DRY_RUN:
+            wait_if_limited()
             res = requests.post(f"{FD_BASE_URL}/contacts", auth=FD_AUTH, headers=FD_HEADERS, json={"email": email, "name": email.split('@')[0]})
+            if handle_rate_limits(res): return None
             if res.status_code == 201: return res.json()['id']
     except: pass
     return None
@@ -168,24 +166,30 @@ def merge_tickets(primary_id, secondary_ids):
     if DRY_RUN or not secondary_ids: return False
     url = f"{FD_BASE_URL}/tickets/merge"
     payload = { "primary_id": primary_id, "ticket_ids": secondary_ids }
+    
+    wait_if_limited()
     try:
         res = requests.put(url, auth=FD_AUTH, headers=FD_HEADERS, data=json.dumps(payload))
-        if check_rate_limit(res): return merge_tickets(primary_id, secondary_ids)
+        if handle_rate_limits(res): return False
+        
         if res.status_code in [200, 204]:
-            log(f"   ⚡ Instant Merge: {secondary_ids} into #{primary_id}")
+            log(f"   ⚡ Merged {len(secondary_ids)} tickets into #{primary_id}")
             return True
     except: pass
     return False
 
 # --- LOGIC PIPELINE ---
+
 def fix_requester_if_needed(ticket):
+    """Step 1: Fix Shopify Emails"""
     tid = ticket['id']
     req_id = ticket['requester_id']
     
     if req_id == SHOPIFY_SENDER_ID:
+        wait_if_limited()
         try:
             res = requests.get(f"{FD_BASE_URL}/tickets/{tid}?include=description", auth=FD_AUTH)
-            if check_rate_limit(res): return fix_requester_if_needed(ticket)
+            if handle_rate_limits(res): return req_id
             
             if res.status_code == 200:
                 body = res.json().get('description_text', '')
@@ -193,17 +197,20 @@ def fix_requester_if_needed(ticket):
                 if real_email:
                     new_cid = get_or_create_contact(real_email)
                     if new_cid and not DRY_RUN:
+                        wait_if_limited()
                         requests.put(f"{FD_BASE_URL}/tickets/{tid}", auth=FD_AUTH, headers=FD_HEADERS, json={"requester_id": new_cid})
-                        log(f"   ✅ Fixed Requester -> {real_email}")
+                        log(f"   ✅ Fixed #{tid} Requester -> {real_email}")
                         return new_cid
         except: pass
     return req_id
 
 def perform_merge_check(t_id, requester_id, ticket_object):
+    """Step 2: Check for Duplicates and Merge"""
     query = f"requester_id:{requester_id} AND (status:2 OR status:3)"
+    wait_if_limited()
     try:
         res = requests.get(f"{FD_BASE_URL}/search/tickets?query=\"{query}\"", auth=FD_AUTH)
-        if check_rate_limit(res): return perform_merge_check(t_id, requester_id, ticket_object)
+        if handle_rate_limits(res): return t_id
         
         if res.status_code == 200:
             user_tickets = res.json().get('results', [])
@@ -215,60 +222,75 @@ def perform_merge_check(t_id, requester_id, ticket_object):
                 primary = user_tickets[-1] 
                 secondary = [t['id'] for t in user_tickets if t['id'] != primary['id']]
                 
-                log(f"   🔄 Merging {len(secondary)} duplicates...")
+                log(f"   🔄 Merging duplicates for #{primary['id']}...")
                 if merge_tickets(primary['id'], secondary):
-                    if t_id in secondary: return None 
-                    else: return primary['id'] 
+                    if t_id in secondary: return None # Current ticket deleted
+                    else: return primary['id'] # Return surviving ID
     except: pass
     return t_id
 
-def assign_group_and_agent(t_id, current_group_id, current_responder_id):
-    target_group_id = get_group_id()
-    if not target_group_id: return
-
+def assign_active_agent(t_id, current_responder_id):
+    """Step 3: Assign to Clocked-In Agent"""
     active_agents = get_active_agents_via_clockify()
     target_responder = None
     
+    # CASE 1: Keep current agent if they are ONLINE
     if current_responder_id in active_agents:
         target_responder = current_responder_id
+        
+    # CASE 2: If Unassigned OR Assigned to OFFLINE -> Reassign
     else:
         if active_agents:
             import random
             target_responder = random.choice(active_agents)
         else:
+            # Everyone is offline. Keep current owner if exists, else leave unassigned.
             target_responder = current_responder_id 
 
-    payload = {}
-    if current_group_id != target_group_id: payload['group_id'] = target_group_id
-    if target_responder != current_responder_id:
-        payload['responder_id'] = target_responder
-        payload['group_id'] = target_group_id 
-
-    if payload:
+    # Only update if it changed
+    if target_responder and target_responder != current_responder_id:
         if not DRY_RUN:
+            wait_if_limited()
+            payload = {"responder_id": target_responder}
             res = requests.put(f"{FD_BASE_URL}/tickets/{t_id}", auth=FD_AUTH, headers=FD_HEADERS, json=payload)
-            if check_rate_limit(res): return # Simple skip if limited on assign
+            
+            if handle_rate_limits(res): return
             if res.status_code == 200:
-                agent_msg = f" -> Agent {target_responder}" if target_responder else " (No Online Agents)"
-                log(f"   ✅ Assigned #{t_id} -> Group 'Agents'{agent_msg}")
+                log(f"   👮 Assigned #{t_id} -> Agent {target_responder}")
 
-def process_single_ticket(ticket_object):
-    t_id = ticket_object['id']
+def process_single_ticket(ticket_data):
+    wait_if_limited()
+    t_id = ticket_data['id']
     log(f"⚡ Processing #{t_id}...")
-
-    real_req_id = fix_requester_if_needed(ticket_object)
-    surviving_id = perform_merge_check(t_id, real_req_id, ticket_object)
     
-    if surviving_id:
-        try:
-            res = requests.get(f"{FD_BASE_URL}/tickets/{surviving_id}", auth=FD_AUTH)
-            if check_rate_limit(res): return
-            if res.status_code == 200:
-                upd = res.json()
-                assign_group_and_agent(surviving_id, upd.get('group_id'), upd.get('responder_id'))
-        except: pass
+    # Fetch full ticket to get current status
+    try:
+        res = requests.get(f"{FD_BASE_URL}/tickets/{t_id}", auth=FD_AUTH)
+        if handle_rate_limits(res): return
+        if res.status_code == 200:
+            full_ticket = res.json()
+            
+            # 1. Fix Requester
+            real_req_id = fix_requester_if_needed(full_ticket)
+            
+            # 2. Merge Duplicates
+            surviving_id = perform_merge_check(t_id, real_req_id, full_ticket)
+            
+            # 3. Assign Agent (If ticket survived merge)
+            if surviving_id:
+                # If we merged, we might need to re-fetch the survivor's status?
+                # Usually fine to just proceed if it was the primary.
+                # If t_id changed to primary, we use that ID.
+                
+                # Re-fetch survivor to be safe about responder status
+                res_s = requests.get(f"{FD_BASE_URL}/tickets/{surviving_id}", auth=FD_AUTH)
+                if res_s.status_code == 200:
+                    survivor_ticket = res_s.json()
+                    assign_active_agent(surviving_id, survivor_ticket.get('responder_id'))
 
-# --- WORKER THREAD (THE QUEUE PROCESSOR) ---
+    except Exception as e: log(f"Process Error: {e}")
+
+# --- WORKER THREAD ---
 def worker():
     while True:
         ticket_data = TICKET_QUEUE.get()
@@ -278,7 +300,7 @@ def worker():
             log(f"Worker Error: {e}")
         finally:
             TICKET_QUEUE.task_done()
-            time.sleep(2) # Safe delay between tickets to avoid Rate Limits
+            time.sleep(10) # 10s delay to protect API limits
 
 # --- WEBHOOK ---
 @app.route('/webhook', methods=['POST'])
@@ -286,58 +308,49 @@ def webhook():
     data = request.json
     t_id = data.get('ticket_id')
     if t_id:
-        # Instead of processing immediately, put it in the Waiting Line
-        # We construct a minimal ticket object for the queue
-        ticket_obj = {'id': t_id, 'requester_id': data.get('requester_id')}
-        TICKET_QUEUE.put(ticket_obj)
-        return "Queued", 200
-    return "No ID", 400
+        TICKET_QUEUE.put({'id': t_id, 'requester_id': data.get('requester_id')})
+    return "Queued", 200
+
+# --- HEALTH CHECK ---
+@app.route('/', methods=['GET', 'HEAD'])
+def health_check():
+    return "Healthy", 200
 
 # --- SWEEPER ---
 def run_backlog_sweep():
-    log("🧹 STARTING BACKLOG SWEEP...")
-    group_id = get_group_id()
-    if not group_id: return
-
-    # Check agents status once per sweep
-    active = get_active_agents_via_clockify()
-    if not active: log("   ⚠️ All Agents Offline. Script will Fix & Merge only.")
+    # log("🧹 STARTING SWEEP...")
+    wait_if_limited()
     
     page = 1
-    query = f"(status:2 OR status:3) AND group_id:{group_id}" 
+    query = "status:2 OR status:3" 
     
     while True:
         try:
             res = requests.get(f"{FD_BASE_URL}/search/tickets?query=\"{query}\"&page={page}", auth=FD_AUTH)
-            if check_rate_limit(res): continue
+            if handle_rate_limits(res): break
             if res.status_code != 200: break
+            
             tickets = res.json().get('results', [])
             if not tickets: break
             
-            log(f"   🔎 Sweeping Batch {page}: Found {len(tickets)} tickets. Adding to Queue...")
+            log(f"   🔎 Sweeper Batch {page}: Queuing {len(tickets)} tickets...")
             for ticket in tickets:
                 TICKET_QUEUE.put(ticket)
             
             if len(tickets) < 30: break 
             page += 1
         except: break
-    log("✅ Sweep items queued.")
 
 def background_worker():
-    # Start the Queue Worker Thread
     threading.Thread(target=worker, daemon=True).start()
-    
-    time.sleep(5) 
+    time.sleep(10) 
     run_backlog_sweep()
     while True:
-        log("💤 Sweeper sleeping 10 mins...")
-        time.sleep(600)
+        time.sleep(900)
         run_backlog_sweep()
 
 threading.Thread(target=background_worker, daemon=True).start()
 
 if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 5000))
-    # Note: On Render this will use their PORT, locally it uses 5000
-    log(f"🚀 DISPATCHER STARTED (Port {port})")
+    port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
