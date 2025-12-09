@@ -8,27 +8,24 @@ from flask import Flask, request
 import requests
 
 # ================= CONFIGURATION =================
-# Freshdesk Config
+# Freshdesk
 FD_DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 FD_API_KEY = os.environ.get("FRESHDESK_API_KEY")
 
-# Clockify Config (ADD THESE TO RENDER ENV VARS)
+# Clockify
 CLOCK_API_KEY = os.environ.get("CLOCKIFY_API_KEY")
-# If you don't know your Workspace ID, the script will find it automatically.
-CLOCK_WORKSPACE_ID = os.environ.get("CLOCKIFY_WORKSPACE_ID") 
 
-# The 3 Agents we trust (Jean, Lance, Vanesa)
-AGENT_IDS = [
-    159009628844, 
-    159009628874, 
-    159009628889
-]
-
+# Agents (Jean, Lance, Vanesa)
+AGENT_IDS = [159009628844, 159009628874, 159009628889]
 TARGET_GROUP_NAME = "Agents" 
 SHOPIFY_SENDER_ID = 159009730069
-IGNORE_EMAILS = ["actorahelp@gmail.com", "customerservice@actorasupport.com", "mailer@shopify.com", "no-reply@shopify.com", "notifications@shopify.com", "support@actorasupport.com"]
 
-# 🚨 LIVE MODE 🚨
+IGNORE_EMAILS = [
+    "actorahelp@gmail.com", "customerservice@actorasupport.com", 
+    "mailer@shopify.com", "no-reply@shopify.com", 
+    "notifications@shopify.com", "support@actorasupport.com"
+]
+
 DRY_RUN = False  
 # =================================================
 
@@ -41,10 +38,9 @@ CLOCK_HEADERS = {"X-Api-Key": CLOCK_API_KEY}
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 def log(msg): logging.info(msg)
 
-# Global Cache
 CACHED_GROUP_ID = None
-CACHED_WORKSPACE_ID = CLOCK_WORKSPACE_ID
-CACHED_CLOCKIFY_USERS = {} # Map email -> Clockify User ID
+# Cache for Clockify Users: { "email": { "workspace_id": "user_id" } }
+CACHED_CLOCKIFY_MAP = {} 
 
 def check_rate_limit(response):
     if response.status_code == 429:
@@ -54,85 +50,84 @@ def check_rate_limit(response):
         return True
     return False
 
-# --- CLOCKIFY LOGIC ---
-def get_clockify_workspace():
-    global CACHED_WORKSPACE_ID
-    if CACHED_WORKSPACE_ID: return CACHED_WORKSPACE_ID
+# --- CLOCKIFY LOGIC (DEEP DEBUG) ---
+def build_clockify_cache():
+    """Scans ALL workspaces to find where users are located."""
+    global CACHED_CLOCKIFY_MAP
+    CACHED_CLOCKIFY_MAP = {}
+    
+    log("🏗️ Building Clockify User Cache...")
     
     try:
+        # 1. Get All Workspaces
         res = requests.get("https://api.clockify.me/api/v1/workspaces", headers=CLOCK_HEADERS)
-        if res.status_code == 200:
-            workspaces = res.json()
-            if workspaces:
-                # Default to the first workspace found
-                CACHED_WORKSPACE_ID = workspaces[0]['id']
-                log(f"   🕒 Found Clockify Workspace: {workspaces[0]['name']}")
-                return CACHED_WORKSPACE_ID
-    except Exception as e: log(f"Clockify Workspace Error: {e}")
-    return None
+        if res.status_code != 200:
+            log(f"❌ Clockify Error: {res.status_code} - {res.text}")
+            return
 
-def get_clockify_user_id(email):
-    global CACHED_CLOCKIFY_USERS
-    if email in CACHED_CLOCKIFY_USERS: return CACHED_CLOCKIFY_USERS[email]
-    
-    ws_id = get_clockify_workspace()
-    if not ws_id: return None
-    
-    try:
-        # Fetch all users in workspace
-        res = requests.get(f"https://api.clockify.me/api/v1/workspaces/{ws_id}/users", headers=CLOCK_HEADERS)
-        if res.status_code == 200:
-            users = res.json()
-            for u in users:
-                # Cache everyone found
-                CACHED_CLOCKIFY_USERS[u['email']] = u['id']
+        workspaces = res.json()
+        for ws in workspaces:
+            ws_id = ws['id']
+            ws_name = ws['name']
+            log(f"   🏢 Checking Workspace: {ws_name}")
             
-            return CACHED_CLOCKIFY_USERS.get(email)
-    except: pass
-    return None
+            # 2. Get Users in this Workspace
+            res_u = requests.get(f"https://api.clockify.me/api/v1/workspaces/{ws_id}/users", headers=CLOCK_HEADERS)
+            if res_u.status_code == 200:
+                users = res_u.json()
+                for u in users:
+                    email = u['email'].lower()
+                    # Map Email -> (WorkspaceID, UserID)
+                    CACHED_CLOCKIFY_MAP[email] = (ws_id, u['id'])
+                    # log(f"      👤 Found User: {email}")
+            else:
+                log(f"      ❌ Failed to get users for {ws_name}")
+
+        log(f"✅ Cache Built. Found {len(CACHED_CLOCKIFY_MAP)} total users.")
+
+    except Exception as e: log(f"Clockify Init Error: {e}")
 
 def is_user_clocked_in(email):
-    ws_id = get_clockify_workspace()
-    user_id = get_clockify_user_id(email)
+    email = email.lower()
     
-    if not ws_id or not user_id: return False
+    # Lazy Load Cache
+    if not CACHED_CLOCKIFY_MAP:
+        build_clockify_cache()
+    
+    if email not in CACHED_CLOCKIFY_MAP:
+        # log(f"      ⚠️ Email '{email}' not found in Clockify map.")
+        return False
+    
+    ws_id, user_id = CACHED_CLOCKIFY_MAP[email]
     
     try:
-        # Check for currently running timer
         url = f"https://api.clockify.me/api/v1/workspaces/{ws_id}/user/{user_id}/time-entries?in-progress=true"
         res = requests.get(url, headers=CLOCK_HEADERS)
         if res.status_code == 200:
             entries = res.json()
-            # If list is not empty, they have a running timer
-            return len(entries) > 0
+            is_active = len(entries) > 0
+            if is_active: 
+                log(f"      🟢 {email} is CLOCKED IN.")
+            return is_active
     except: pass
     return False
 
 def get_active_agents_via_clockify():
-    """
-    Checks our 3 agents. Instead of asking Freshdesk if they are 'Available',
-    we ask Clockify if they are 'Clocked In'.
-    """
     active_list = []
+    # log("🔎 Checking Agent Status...")
     
     for agent_id in AGENT_IDS:
-        # 1. Get Agent Email from Freshdesk
         try:
+            # Get Freshdesk Email
             res = requests.get(f"{FD_BASE_URL}/agents/{agent_id}", auth=FD_AUTH)
             if res.status_code == 200:
-                agent_data = res.json()
-                email = agent_data['contact']['email']
-                name = agent_data['contact']['name']
+                data = res.json()
+                email = data['contact']['email']
                 
-                # 2. Check Clockify Status
-                if is_user_clocked_in(email):
-                    # log(f"   🕒 {name} is CLOCKED IN.")
+                if is_user_clocked_in(email): 
                     active_list.append(agent_id)
-                else:
-                    # log(f"   zzz {name} is Clocked Out.")
-                    pass
         except: pass
-        
+    
     return active_list
 
 # --- FRESHDESK HELPERS ---
@@ -145,6 +140,7 @@ def get_group_id():
             for g in res.json():
                 if g['name'].lower() == TARGET_GROUP_NAME.lower():
                     CACHED_GROUP_ID = g['id']
+                    log(f"   ✅ Found Group '{g['name']}' -> ID: {CACHED_GROUP_ID}")
                     return CACHED_GROUP_ID
     except: pass
     return None
@@ -187,6 +183,7 @@ def fix_requester_if_needed(ticket):
 def merge_tickets(primary_id, secondary_ids):
     if DRY_RUN or not secondary_ids: return False
     url = f"{FD_BASE_URL}/tickets/merge"
+    # CORRECT PAYLOAD from Screenshot
     payload = { "primary_id": primary_id, "ticket_ids": secondary_ids }
     try:
         res = requests.put(url, auth=FD_AUTH, headers=FD_HEADERS, data=json.dumps(payload))
@@ -194,7 +191,9 @@ def merge_tickets(primary_id, secondary_ids):
         if res.status_code in [200, 204]:
             log(f"   ⚡ Instant Merge: {secondary_ids} into #{primary_id}")
             return True
-    except: pass
+        else:
+            log(f"   ❌ Merge Failed: {res.status_code} - {res.text}")
+    except Exception as e: log(f"Merge Err: {e}")
     return False
 
 # --- CORE LOGIC ---
@@ -218,26 +217,26 @@ def process_single_ticket(ticket_object):
                 primary = user_tickets[-1] 
                 secondary = [t['id'] for t in user_tickets if t['id'] != primary['id']]
                 
+                log(f"   🔄 Merging {len(secondary)} duplicates into #{primary['id']}...")
                 if merge_tickets(primary['id'], secondary):
                     if t_id in secondary:
-                        log(f"   🛑 Ticket #{t_id} merged. Done.")
-                        return 
+                        return # Stop processing deleted ticket
                     else:
                         t_id = primary['id']
     except Exception as e: log(f"Merge Error: {e}")
 
-    # 3. ASSIGN (Via Clockify Status)
+    # 3. ASSIGN (Via Clockify)
     active_agents = get_active_agents_via_clockify()
     group_id = get_group_id()
     
     current_responder = ticket_object.get('responder_id')
     should_assign = False
     
-    # Logic: Assign if Unassigned OR if currently assigned agent is Clocked Out
+    # If unassigned, assign it.
     if current_responder is None: 
         should_assign = True
+    # If assigned to our team but they went offline, reassign.
     elif current_responder in AGENT_IDS and current_responder not in active_agents:
-        # Reassign if they clocked out
         should_assign = True
     
     if should_assign:
@@ -250,7 +249,7 @@ def process_single_ticket(ticket_object):
                 requests.put(f"{FD_BASE_URL}/tickets/{t_id}", auth=FD_AUTH, headers=FD_HEADERS, json=payload)
                 log(f"   👮 Assigned #{t_id} -> Agent {target} (Clocked In)")
         else:
-             # log(f"   ⚠️ No agents clocked in. Ticket #{t_id} waiting.")
+             # log(f"   💤 No agents clocked in. Ticket #{t_id} waiting.")
              pass
 
 # --- WEBHOOK ---
@@ -269,14 +268,19 @@ def webhook():
 
 # --- SWEEPER ---
 def run_backlog_sweep():
-    log("🧹 STARTING BACKLOG SWEEP (Checking Clockify Status)...")
-    group_id = get_group_id()
-    if not group_id: return
-
-    # Check who is working right now
+    log("🧹 STARTING BACKLOG SWEEP...")
+    
+    # Init Cache once
+    if not CACHED_CLOCKIFY_MAP: build_clockify_cache()
+    
     active = get_active_agents_via_clockify()
     if not active:
-        log("   💤 Everyone is clocked out. Sweep skipped (Merging only).")
+        log("   ⚠️ No agents clocked in. Merging only.")
+    else:
+        log(f"   ✅ Agents Clocked In: {len(active)}")
+
+    group_id = get_group_id()
+    if not group_id: return
 
     page = 1
     query = f"group_id:{group_id} AND (status:2 OR status:3)"
@@ -288,12 +292,12 @@ def run_backlog_sweep():
             if res.status_code != 200: break
             tickets = res.json().get('results', [])
             if not tickets: break
+            
             log(f"   🔎 Sweeping Batch {page}: {len(tickets)} tickets...")
             for ticket in tickets:
-                # If active agents exist, pass None to force re-check inside (slower) or pass list (faster)
-                # Let's re-check inside process_single_ticket so we have freshest data
-                process_single_ticket(ticket) 
+                process_single_ticket(ticket)
                 time.sleep(0.2)
+            
             if len(tickets) < 30: break 
             page += 1
         except: break
@@ -311,7 +315,7 @@ threading.Thread(target=background_worker, daemon=True).start()
 
 @app.route('/')
 def home():
-    return "Auto-Dispatcher (CLOCKIFY MODE) Running", 200
+    return "Auto-Dispatcher (DEEP DEBUG) Running", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
