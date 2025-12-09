@@ -10,13 +10,19 @@ import requests
 # ================= CONFIGURATION =================
 DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
+
+# Group ID for "Agents"
 TARGET_GROUP_ID = 159000817198
+# Shopify System User ID
 SHOPIFY_SENDER_ID = 159009730069
+
 IGNORE_EMAILS = [
     "actorahelp@gmail.com", "customerservice@actorasupport.com",
     "mailer@shopify.com", "no-reply@shopify.com",
     "notifications@shopify.com", "support@actorasupport.com"
 ]
+
+# 🚨 LIVE MODE 🚨
 DRY_RUN = False  
 # =================================================
 
@@ -36,47 +42,7 @@ def check_rate_limit(response):
         return True
     return False
 
-# --- DIAGNOSTIC: GET AGENT STATUS ---
-def get_available_agents():
-    agents = []
-    log("🔎 Scanning Agent Statuses...")
-    try:
-        page = 1
-        while True:
-            # Fetch agents in the group
-            res = requests.get(f"{BASE_URL}/groups/{TARGET_GROUP_ID}/agents?per_page=100&page={page}", auth=AUTH)
-            if res.status_code != 200:
-                log(f"   ❌ Failed to fetch agents: {res.status_code}")
-                break
-            
-            data = res.json()
-            if not data: break
-            
-            for a in data:
-                name = a['contact']['name']
-                is_available = a.get('available', False)
-                
-                # --- PRINT EVERY AGENT STATUS ---
-                status_icon = "🟢" if is_available else "🔴"
-                log(f"   {status_icon} Agent: {name} | API Status: {'AVAILABLE' if is_available else 'OFFLINE/BUSY'}")
-                
-                if is_available:
-                    agents.append(a['id'])
-            
-            page += 1
-    except Exception as e: log(f"Agent Scan Error: {e}")
-    
-    if not agents:
-        log("   ⚠️ RESULT: API sees 0 agents as 'Available'. Check their Profile Toggle!")
-    else:
-        log(f"   ✅ RESULT: Found {len(agents)} agents ready for work.")
-        
-    return agents
-
-# ... [REST OF THE SCRIPT REMAINS THE SAME - HELPERS, MERGE, PROCESS, WEBHOOK] ...
-# (Use the previous complete script logic for the rest, just swapping this function)
-
-# --- RE-INCLUDE HELPERS FOR COMPLETENESS ---
+# --- HELPER FUNCTIONS ---
 def find_best_email(body_text):
     if not body_text: return None
     candidates = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', body_text)
@@ -115,6 +81,7 @@ def fix_requester_if_needed(ticket):
 def merge_tickets(primary_id, secondary_ids):
     if DRY_RUN or not secondary_ids: return False
     url = f"{BASE_URL}/tickets/merge"
+    # CORRECT PAYLOAD (Confirmed by Support)
     payload = { "primary_id": primary_id, "ticket_ids": secondary_ids }
     try:
         res = requests.put(url, auth=AUTH, headers=HEADERS, data=json.dumps(payload))
@@ -125,13 +92,39 @@ def merge_tickets(primary_id, secondary_ids):
     except: pass
     return False
 
+def get_available_agents():
+    """
+    Fetches agents. If none are explicitly 'Available' (toggle missing),
+    it falls back to 'All Agents in Group'.
+    """
+    all_agents = []
+    available_agents = []
+    
+    try:
+        res = requests.get(f"{BASE_URL}/groups/{TARGET_GROUP_ID}/agents", auth=AUTH)
+        if res.status_code == 200:
+            for a in res.json():
+                all_agents.append(a['id'])
+                if a.get("available", False): 
+                    available_agents.append(a['id'])
+    except: pass
+
+    if available_agents:
+        return available_agents
+    else:
+        # FALLBACK: If API says nobody is online (because toggle is missing),
+        # assume EVERYONE is working and return the full list.
+        if all_agents:
+            # log(f"   ⚠️ No 'Available' status found. Using FORCE MODE: Distributing to all {len(all_agents)} agents.")
+            return all_agents
+        return []
+
+# --- CORE LOGIC ---
 def process_single_ticket(ticket_object, active_agents=None):
     t_id = ticket_object['id']
-    
-    # 1. FIX REQUESTER
     real_req_id = fix_requester_if_needed(ticket_object)
     
-    # 2. MERGE CHECK
+    # MERGE CHECK
     query = f"requester_id:{real_req_id} AND (status:2 OR status:3)"
     try:
         res = requests.get(f"{BASE_URL}/search/tickets?query=\"{query}\"", auth=AUTH)
@@ -153,17 +146,14 @@ def process_single_ticket(ticket_object, active_agents=None):
                         t_id = primary['id']
     except Exception as e: log(f"Merge Error: {e}")
 
-    # 3. ASSIGN
-    # Always refresh agents if not provided to be safe
+    # ASSIGNMENT
     if not active_agents: active_agents = get_available_agents()
     
     current_responder = ticket_object.get('responder_id')
     should_assign = False
     
     if current_responder is None: should_assign = True
-    elif current_responder not in active_agents: 
-        log(f"   ⚠️ Reassigning: Current Agent is Offline.")
-        should_assign = True
+    elif current_responder not in active_agents: should_assign = True
     
     if should_assign and active_agents:
         import random
@@ -171,9 +161,8 @@ def process_single_ticket(ticket_object, active_agents=None):
         if not DRY_RUN:
             requests.put(f"{BASE_URL}/tickets/{t_id}", auth=AUTH, headers=HEADERS, json={"responder_id": target})
             log(f"   👮 Assigned #{t_id} -> Agent {target}")
-    elif should_assign and not active_agents:
-        log(f"   ⚠️ Cannot assign #{t_id}: No agents available!")
 
+# --- WEBHOOK ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
@@ -187,10 +176,13 @@ def webhook():
         except: pass
     return "OK", 200
 
+# --- SWEEPER ---
 def run_backlog_sweep():
     log("🧹 STARTING BACKLOG SWEEP...")
-    active_agents = get_available_agents() # This will print the status report
-    if not active_agents: return
+    active_agents = get_available_agents()
+    if not active_agents: 
+        log("⚠️ CRITICAL: No agents found in group at all!")
+        return
 
     page = 1
     query = f"group_id:{TARGET_GROUP_ID} AND (status:2 OR status:3)"
@@ -222,7 +214,7 @@ threading.Thread(target=background_worker, daemon=True).start()
 
 @app.route('/')
 def home():
-    return "Auto-Dispatcher (DIAGNOSTIC MODE) Running", 200
+    return "Auto-Dispatcher (FORCE MODE) Running", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
