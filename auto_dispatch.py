@@ -4,17 +4,23 @@ import json
 import logging
 import os
 import re
+import queue
 from datetime import datetime
 from flask import Flask, request
 import requests
 
-# ================= PRODUCTION CONFIGURATION =================
-# Pulls from Render Environment Variables
+# ================= CONFIGURATION =================
+# 1. Try to get keys from Environment (Render)
 FD_DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 FD_API_KEY = os.environ.get("FRESHDESK_API_KEY")
 CLOCK_API_KEY = os.environ.get("CLOCKIFY_API_KEY")
 
-# AGENT LIST (Cyril, Jean, Lance, Vanesa)
+# 2. Fallback to Hardcoded Keys (Local Testing)
+if not FD_DOMAIN: FD_DOMAIN = "actorasupport.freshdesk.com"
+if not FD_API_KEY: FD_API_KEY = "nToPJRmvqzHHWJ6pib36"
+if not CLOCK_API_KEY: CLOCK_API_KEY = "MWFlZWY4MDctYWE5Zi00NDFkLWE1ODItMzg5OGQ0MmYwY2Uy"
+
+# Agents
 AGENT_IDS = [
     159009628895, # Cyril Poche
     159009628844, # Jean Kreanne Dawatan
@@ -32,13 +38,16 @@ IGNORE_EMAILS = [
 ]
 
 DRY_RUN = False  
-# ============================================================
+# =======================================================
 
 app = Flask(__name__)
 FD_BASE_URL = f"https://{FD_DOMAIN}/api/v2"
 FD_AUTH = (FD_API_KEY, "X")
 FD_HEADERS = {"Content-Type": "application/json"}
 CLOCK_HEADERS = {"X-Api-Key": CLOCK_API_KEY}
+
+# GLOBAL QUEUE (The Waiting Line)
+TICKET_QUEUE = queue.Queue()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 def log(msg): logging.info(msg)
@@ -50,7 +59,7 @@ CACHED_CLOCKIFY_MAP = {}
 def check_rate_limit(response):
     if response.status_code == 429:
         retry = int(response.headers.get("Retry-After", 60))
-        log(f"⚠️ Rate limit hit. Sleeping {retry}s...")
+        log(f"⚠️ Rate limit hit. Pausing worker for {retry}s...")
         time.sleep(retry + 5)
         return True
     return False
@@ -58,11 +67,7 @@ def check_rate_limit(response):
 # --- CLOCKIFY LOGIC ---
 def init_clockify():
     global CACHED_WORKSPACE_ID
-    if not CLOCK_API_KEY:
-        log("❌ Clockify Key Missing! Check Environment Variables.")
-        return False
-
-    log("🔑 Authenticating with Clockify...")
+    # log("🔑 Authenticating with Clockify...")
     try:
         res = requests.get("https://api.clockify.me/api/v1/user", headers=CLOCK_HEADERS)
         if res.status_code == 200:
@@ -70,12 +75,8 @@ def init_clockify():
             default_ws = user_data.get('defaultWorkspace')
             active_ws = user_data.get('activeWorkspace')
             CACHED_WORKSPACE_ID = default_ws if default_ws else active_ws
-            log(f"   👤 Clockify User: {user_data.get('name')}")
-            log(f"   🏢 Workspace ID: {CACHED_WORKSPACE_ID}")
             return True
-        else:
-            log(f"❌ Clockify Auth Failed: {res.status_code}")
-    except Exception as e: log(f"Clockify Error: {e}")
+    except: pass
     return False
 
 def build_clockify_cache():
@@ -89,7 +90,7 @@ def build_clockify_cache():
         if res.status_code == 200:
             for u in res.json():
                 CACHED_CLOCKIFY_MAP[u['email'].lower()] = u['id']
-            log(f"✅ Clockify Cache Built ({len(CACHED_CLOCKIFY_MAP)} users).")
+            log(f"✅ Clockify Cache Updated ({len(CACHED_CLOCKIFY_MAP)} users).")
     except: pass
 
 def is_user_clocked_in(email):
@@ -105,15 +106,15 @@ def is_user_clocked_in(email):
         if res.status_code == 200:
             entries = res.json()
             if len(entries) > 0:
-                # Log active timer for visibility
                 start_time = entries[0].get('timeInterval', {}).get('start', 'Unknown')
-                log(f"      🟢 {email} is ONLINE (Started: {start_time})")
+                # log(f"      🟢 {email} is ONLINE (Started: {start_time})")
                 return True
     except: pass
     return False
 
 def get_active_agents_via_clockify():
     active_list = []
+    # Refresh cache occasionally or if empty
     if not CACHED_CLOCKIFY_MAP: build_clockify_cache()
     
     for agent_id in AGENT_IDS:
@@ -180,9 +181,12 @@ def merge_tickets(primary_id, secondary_ids):
 def fix_requester_if_needed(ticket):
     tid = ticket['id']
     req_id = ticket['requester_id']
+    
     if req_id == SHOPIFY_SENDER_ID:
         try:
             res = requests.get(f"{FD_BASE_URL}/tickets/{tid}?include=description", auth=FD_AUTH)
+            if check_rate_limit(res): return fix_requester_if_needed(ticket)
+            
             if res.status_code == 200:
                 body = res.json().get('description_text', '')
                 real_email = find_best_email(body)
@@ -199,6 +203,8 @@ def perform_merge_check(t_id, requester_id, ticket_object):
     query = f"requester_id:{requester_id} AND (status:2 OR status:3)"
     try:
         res = requests.get(f"{FD_BASE_URL}/search/tickets?query=\"{query}\"", auth=FD_AUTH)
+        if check_rate_limit(res): return perform_merge_check(t_id, requester_id, ticket_object)
+        
         if res.status_code == 200:
             user_tickets = res.json().get('results', [])
             ids = [t['id'] for t in user_tickets]
@@ -223,16 +229,14 @@ def assign_group_and_agent(t_id, current_group_id, current_responder_id):
     active_agents = get_active_agents_via_clockify()
     target_responder = None
     
-    # 1. Keep current if Online
     if current_responder_id in active_agents:
         target_responder = current_responder_id
-    # 2. Reassign if Unassigned or Offline
     else:
         if active_agents:
             import random
             target_responder = random.choice(active_agents)
         else:
-            target_responder = current_responder_id # Keep existing if everyone offline
+            target_responder = current_responder_id 
 
     payload = {}
     if current_group_id != target_group_id: payload['group_id'] = target_group_id
@@ -243,6 +247,7 @@ def assign_group_and_agent(t_id, current_group_id, current_responder_id):
     if payload:
         if not DRY_RUN:
             res = requests.put(f"{FD_BASE_URL}/tickets/{t_id}", auth=FD_AUTH, headers=FD_HEADERS, json=payload)
+            if check_rate_limit(res): return # Simple skip if limited on assign
             if res.status_code == 200:
                 agent_msg = f" -> Agent {target_responder}" if target_responder else " (No Online Agents)"
                 log(f"   ✅ Assigned #{t_id} -> Group 'Agents'{agent_msg}")
@@ -250,16 +255,30 @@ def assign_group_and_agent(t_id, current_group_id, current_responder_id):
 def process_single_ticket(ticket_object):
     t_id = ticket_object['id']
     log(f"⚡ Processing #{t_id}...")
+
     real_req_id = fix_requester_if_needed(ticket_object)
     surviving_id = perform_merge_check(t_id, real_req_id, ticket_object)
     
     if surviving_id:
         try:
             res = requests.get(f"{FD_BASE_URL}/tickets/{surviving_id}", auth=FD_AUTH)
+            if check_rate_limit(res): return
             if res.status_code == 200:
                 upd = res.json()
                 assign_group_and_agent(surviving_id, upd.get('group_id'), upd.get('responder_id'))
         except: pass
+
+# --- WORKER THREAD (THE QUEUE PROCESSOR) ---
+def worker():
+    while True:
+        ticket_data = TICKET_QUEUE.get()
+        try:
+            process_single_ticket(ticket_data)
+        except Exception as e:
+            log(f"Worker Error: {e}")
+        finally:
+            TICKET_QUEUE.task_done()
+            time.sleep(2) # Safe delay between tickets to avoid Rate Limits
 
 # --- WEBHOOK ---
 @app.route('/webhook', methods=['POST'])
@@ -267,8 +286,12 @@ def webhook():
     data = request.json
     t_id = data.get('ticket_id')
     if t_id:
-        threading.Thread(target=lambda: process_single_ticket({'id': t_id, 'requester_id': data.get('requester_id')})).start()
-    return "OK", 200
+        # Instead of processing immediately, put it in the Waiting Line
+        # We construct a minimal ticket object for the queue
+        ticket_obj = {'id': t_id, 'requester_id': data.get('requester_id')}
+        TICKET_QUEUE.put(ticket_obj)
+        return "Queued", 200
+    return "No ID", 400
 
 # --- SWEEPER ---
 def run_backlog_sweep():
@@ -276,6 +299,7 @@ def run_backlog_sweep():
     group_id = get_group_id()
     if not group_id: return
 
+    # Check agents status once per sweep
     active = get_active_agents_via_clockify()
     if not active: log("   ⚠️ All Agents Offline. Script will Fix & Merge only.")
     
@@ -289,17 +313,21 @@ def run_backlog_sweep():
             if res.status_code != 200: break
             tickets = res.json().get('results', [])
             if not tickets: break
-            log(f"   🔎 Sweeping Batch {page}: {len(tickets)} tickets...")
+            
+            log(f"   🔎 Sweeping Batch {page}: Found {len(tickets)} tickets. Adding to Queue...")
             for ticket in tickets:
-                process_single_ticket(ticket)
-                time.sleep(0.5)
+                TICKET_QUEUE.put(ticket)
+            
             if len(tickets) < 30: break 
             page += 1
         except: break
-    log("✅ Sweep Complete.")
+    log("✅ Sweep items queued.")
 
 def background_worker():
-    time.sleep(10) # Let Flask boot
+    # Start the Queue Worker Thread
+    threading.Thread(target=worker, daemon=True).start()
+    
+    time.sleep(5) 
     run_backlog_sweep()
     while True:
         log("💤 Sweeper sleeping 10 mins...")
@@ -309,5 +337,7 @@ def background_worker():
 threading.Thread(target=background_worker, daemon=True).start()
 
 if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 10000))
+    port = int(os.environ.get('PORT', 5000))
+    # Note: On Render this will use their PORT, locally it uses 5000
+    log(f"🚀 DISPATCHER STARTED (Port {port})")
     app.run(host='0.0.0.0', port=port)
