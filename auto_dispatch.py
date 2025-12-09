@@ -10,19 +10,13 @@ import requests
 # ================= CONFIGURATION =================
 DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 API_KEY = os.environ.get("FRESHDESK_API_KEY")
-
-# Group ID for "Agents"
 TARGET_GROUP_ID = 159000817198
-# Shopify System User ID
 SHOPIFY_SENDER_ID = 159009730069
-
 IGNORE_EMAILS = [
     "actorahelp@gmail.com", "customerservice@actorasupport.com",
     "mailer@shopify.com", "no-reply@shopify.com",
     "notifications@shopify.com", "support@actorasupport.com"
 ]
-
-# 🚨 LIVE MODE 🚨
 DRY_RUN = False  
 # =================================================
 
@@ -42,7 +36,47 @@ def check_rate_limit(response):
         return True
     return False
 
-# --- HELPER FUNCTIONS ---
+# --- DIAGNOSTIC: GET AGENT STATUS ---
+def get_available_agents():
+    agents = []
+    log("🔎 Scanning Agent Statuses...")
+    try:
+        page = 1
+        while True:
+            # Fetch agents in the group
+            res = requests.get(f"{BASE_URL}/groups/{TARGET_GROUP_ID}/agents?per_page=100&page={page}", auth=AUTH)
+            if res.status_code != 200:
+                log(f"   ❌ Failed to fetch agents: {res.status_code}")
+                break
+            
+            data = res.json()
+            if not data: break
+            
+            for a in data:
+                name = a['contact']['name']
+                is_available = a.get('available', False)
+                
+                # --- PRINT EVERY AGENT STATUS ---
+                status_icon = "🟢" if is_available else "🔴"
+                log(f"   {status_icon} Agent: {name} | API Status: {'AVAILABLE' if is_available else 'OFFLINE/BUSY'}")
+                
+                if is_available:
+                    agents.append(a['id'])
+            
+            page += 1
+    except Exception as e: log(f"Agent Scan Error: {e}")
+    
+    if not agents:
+        log("   ⚠️ RESULT: API sees 0 agents as 'Available'. Check their Profile Toggle!")
+    else:
+        log(f"   ✅ RESULT: Found {len(agents)} agents ready for work.")
+        
+    return agents
+
+# ... [REST OF THE SCRIPT REMAINS THE SAME - HELPERS, MERGE, PROCESS, WEBHOOK] ...
+# (Use the previous complete script logic for the rest, just swapping this function)
+
+# --- RE-INCLUDE HELPERS FOR COMPLETENESS ---
 def find_best_email(body_text):
     if not body_text: return None
     candidates = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', body_text)
@@ -61,13 +95,10 @@ def get_or_create_contact(email):
     return None
 
 def fix_requester_if_needed(ticket):
-    """Checks if sender is Shopify and fixes it."""
     tid = ticket['id']
     req_id = ticket['requester_id']
-    
     if req_id == SHOPIFY_SENDER_ID:
         try:
-            # We need to fetch the description to find the email
             res = requests.get(f"{BASE_URL}/tickets/{tid}?include=description", auth=AUTH)
             if res.status_code == 200:
                 body = res.json().get('description_text', '')
@@ -84,7 +115,6 @@ def fix_requester_if_needed(ticket):
 def merge_tickets(primary_id, secondary_ids):
     if DRY_RUN or not secondary_ids: return False
     url = f"{BASE_URL}/tickets/merge"
-    # CORRECT PAYLOAD (Confirmed by Support)
     payload = { "primary_id": primary_id, "ticket_ids": secondary_ids }
     try:
         res = requests.put(url, auth=AUTH, headers=HEADERS, data=json.dumps(payload))
@@ -95,37 +125,18 @@ def merge_tickets(primary_id, secondary_ids):
     except: pass
     return False
 
-def get_available_agents():
-    agents = []
-    try:
-        res = requests.get(f"{BASE_URL}/groups/{TARGET_GROUP_ID}/agents", auth=AUTH)
-        if res.status_code == 200:
-            for a in res.json():
-                if a.get("available", False): agents.append(a['id'])
-    except: pass
-    return agents
-
-# --- CORE LOGIC: PROCESS ONE TICKET ---
 def process_single_ticket(ticket_object, active_agents=None):
-    """
-    Main logic pipeline: Fix -> Merge -> Assign.
-    Accepts a Ticket Object (dict) directly.
-    """
     t_id = ticket_object['id']
-    req_id = ticket_object['requester_id']
     
     # 1. FIX REQUESTER
     real_req_id = fix_requester_if_needed(ticket_object)
     
     # 2. MERGE CHECK
-    # We search for OTHER tickets by this user
     query = f"requester_id:{real_req_id} AND (status:2 OR status:3)"
     try:
         res = requests.get(f"{BASE_URL}/search/tickets?query=\"{query}\"", auth=AUTH)
         if res.status_code == 200:
             user_tickets = res.json().get('results', [])
-            
-            # Make sure current ticket is in the list (search lag protection)
             ids = [t['id'] for t in user_tickets]
             if t_id not in ids: user_tickets.append(ticket_object)
 
@@ -137,20 +148,22 @@ def process_single_ticket(ticket_object, active_agents=None):
                 if merge_tickets(primary['id'], secondary):
                     if t_id in secondary:
                         log(f"   🛑 Ticket #{t_id} merged/deleted. Done.")
-                        return # Stop processing
+                        return 
                     else:
-                        t_id = primary['id'] # Continue working on the Primary
+                        t_id = primary['id']
     except Exception as e: log(f"Merge Error: {e}")
 
-    # 3. ASSIGN (If Unassigned or Offline)
-    current_responder = ticket_object.get('responder_id')
-    
-    # Fetch agents if not provided
+    # 3. ASSIGN
+    # Always refresh agents if not provided to be safe
     if not active_agents: active_agents = get_available_agents()
     
+    current_responder = ticket_object.get('responder_id')
     should_assign = False
+    
     if current_responder is None: should_assign = True
-    elif current_responder not in active_agents: should_assign = True
+    elif current_responder not in active_agents: 
+        log(f"   ⚠️ Reassigning: Current Agent is Offline.")
+        should_assign = True
     
     if should_assign and active_agents:
         import random
@@ -158,65 +171,49 @@ def process_single_ticket(ticket_object, active_agents=None):
         if not DRY_RUN:
             requests.put(f"{BASE_URL}/tickets/{t_id}", auth=AUTH, headers=HEADERS, json={"responder_id": target})
             log(f"   👮 Assigned #{t_id} -> Agent {target}")
+    elif should_assign and not active_agents:
+        log(f"   ⚠️ Cannot assign #{t_id}: No agents available!")
 
-# --- WEBHOOK ENDPOINT ---
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
     t_id = data.get('ticket_id')
-    # Fetch full ticket details immediately
     if t_id:
         try:
             res = requests.get(f"{BASE_URL}/tickets/{t_id}", auth=AUTH)
             if res.status_code == 200:
                 ticket_obj = res.json()
-                # Run in background thread to return 200 OK fast
                 threading.Thread(target=process_single_ticket, args=(ticket_obj,)).start()
         except: pass
     return "OK", 200
 
-# --- BACKLOG SWEEPER (The "Missed Ticket" Checker) ---
 def run_backlog_sweep():
-    log("🧹 STARTING BACKLOG SWEEP (Checking missed tickets)...")
-    
-    # 1. Get Agents Once
-    active_agents = get_available_agents()
-    if not active_agents:
-        log("⚠️ No agents online. Skipping sweep.")
-        return
+    log("🧹 STARTING BACKLOG SWEEP...")
+    active_agents = get_available_agents() # This will print the status report
+    if not active_agents: return
 
-    # 2. Get All Open Tickets in Group
     page = 1
     query = f"group_id:{TARGET_GROUP_ID} AND (status:2 OR status:3)"
-    
     while True:
         try:
             res = requests.get(f"{BASE_URL}/search/tickets?query=\"{query}\"&page={page}", auth=AUTH)
             if check_rate_limit(res): continue
             if res.status_code != 200: break
-            
             tickets = res.json().get('results', [])
             if not tickets: break
-            
             log(f"   🔎 Sweeping Batch {page}: {len(tickets)} tickets...")
-            
             for ticket in tickets:
                 process_single_ticket(ticket, active_agents)
-                time.sleep(0.2) # Be gentle during sweep
-            
-            if len(tickets) < 30: break # End of list
+                time.sleep(0.2)
+            if len(tickets) < 30: break 
             page += 1
         except: break
-    
     log("✅ Sweep Complete.")
 
 def background_worker():
-    # Run once immediately on startup
-    time.sleep(10) 
+    time.sleep(5) 
     run_backlog_sweep()
-    
     while True:
-        # Run every 10 minutes
         log("💤 Sweeper sleeping 10 mins...")
         time.sleep(600)
         run_backlog_sweep()
@@ -225,7 +222,7 @@ threading.Thread(target=background_worker, daemon=True).start()
 
 @app.route('/')
 def home():
-    return "Auto-Dispatcher (Webhook + Sweeper) Running", 200
+    return "Auto-Dispatcher (DIAGNOSTIC MODE) Running", 200
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
