@@ -10,14 +10,12 @@ from flask import Flask, request
 import requests
 
 # ================= PRODUCTION CONFIGURATION =================
-# All sensitive data is pulled from Render Environment Variables
+# 1. Credentials (Load from Render Environment)
 FD_DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
 FD_API_KEY = os.environ.get("FRESHDESK_API_KEY")
 CLOCK_API_KEY = os.environ.get("CLOCKIFY_API_KEY")
 
-# AGENT MANAGEMENT
-# Load Agent IDs from Render Env Var "AGENT_IDS" (comma separated)
-# Example: 123456, 789012, 345678
+# 2. Agent Management
 ENV_AGENT_LIST = os.environ.get("AGENT_IDS")
 AGENT_IDS = []
 if ENV_AGENT_LIST:
@@ -25,7 +23,6 @@ if ENV_AGENT_LIST:
         AGENT_IDS = [int(x.strip()) for x in ENV_AGENT_LIST.split(',') if x.strip().isdigit()]
     except: pass
 
-# Identify Shopify Sender ID from Env (or hardcode if generic)
 SHOPIFY_SENDER_ID = int(os.environ.get("SHOPIFY_SENDER_ID", "0"))
 
 IGNORE_EMAILS = [
@@ -34,8 +31,9 @@ IGNORE_EMAILS = [
     "notifications@shopify.com", "support@actorasupport.com"
 ]
 
-# PERFORMANCE SETTINGS (SAFE MODE)
-# currently set to prevent 429 errors (200 req/min limit)
+# PERFORMANCE SETTINGS (SAFE FOR 200 REQ/MIN)
+# 2 Workers x 5s delay = ~24 tickets/min.
+# Max 3 API calls per ticket = ~72 req/min (Very Safe)
 NUM_WORKER_THREADS = 2   
 WORKER_DELAY = 5.0       
 CLOCKIFY_CACHE_SECONDS = 60
@@ -80,7 +78,7 @@ def wait_if_limited():
 def init_clockify():
     global CACHED_WORKSPACE_ID
     if not CLOCK_API_KEY:
-        log("❌ Clockify Key Missing! Check Environment Variables.")
+        log("❌ Clockify Key Missing!")
         return False
 
     wait_if_limited()
@@ -93,8 +91,6 @@ def init_clockify():
             CACHED_WORKSPACE_ID = default_ws if default_ws else active_ws
             log(f"   👤 Clockify Connected: {user_data.get('name')}")
             return True
-        else:
-            log(f"❌ Clockify Auth Failed: {res.status_code}")
     except Exception as e: log(f"Clockify Error: {e}")
     return False
 
@@ -154,9 +150,6 @@ def get_active_agents_via_clockify():
                 primary_email = res.json()['contact']['email']
                 is_active = is_user_clocked_in(primary_email)
                 
-                # Check secondary email logic if needed (Generic Implementation)
-                # You can add specific email overrides here if required in future
-                
                 if is_active: active_list.append(agent_id)
         except: pass
     return active_list
@@ -184,25 +177,13 @@ def get_or_create_contact(email):
     except: pass
     return None
 
-def merge_tickets(primary_id, secondary_ids):
-    if DRY_RUN or not secondary_ids: return False
-    url = f"{FD_BASE_URL}/tickets/merge"
-    payload = { "primary_id": primary_id, "ticket_ids": secondary_ids }
-    
-    wait_if_limited()
-    try:
-        res = requests.put(url, auth=FD_AUTH, headers=FD_HEADERS, data=json.dumps(payload))
-        if handle_rate_limits(res): return False
-        
-        if res.status_code in [200, 204]:
-            log(f"   ⚡ Instant Merge: {secondary_ids} into #{primary_id}")
-            return True
-    except: pass
-    return False
-
 # --- LOGIC PIPELINE ---
 
 def fix_requester_if_needed(ticket):
+    """
+    CRITICAL: We still check this so your External Merger 
+    can match the correct email!
+    """
     tid = ticket['id']
     req_id = ticket['requester_id']
     if req_id == SHOPIFY_SENDER_ID:
@@ -223,30 +204,6 @@ def fix_requester_if_needed(ticket):
                         return new_cid
         except: pass
     return req_id
-
-def perform_merge_check(t_id, requester_id, ticket_object):
-    query = f"requester_id:{requester_id} AND (status:2 OR status:3)"
-    wait_if_limited()
-    try:
-        res = requests.get(f"{FD_BASE_URL}/search/tickets?query=\"{query}\"", auth=FD_AUTH)
-        if handle_rate_limits(res): return t_id
-        
-        if res.status_code == 200:
-            user_tickets = res.json().get('results', [])
-            ids = [t['id'] for t in user_tickets]
-            if t_id not in ids: user_tickets.append(ticket_object)
-
-            if len(user_tickets) > 1:
-                user_tickets.sort(key=lambda x: x['created_at'])
-                primary = user_tickets[-1] 
-                secondary = [t['id'] for t in user_tickets if t['id'] != primary['id']]
-                
-                log(f"   🔄 Merging duplicates for #{primary['id']}...")
-                if merge_tickets(primary['id'], secondary):
-                    if t_id in secondary: return None
-                    else: return primary['id']
-    except: pass
-    return t_id
 
 def assign_to_agent(t_id, current_responder, status_label):
     active_agents = get_active_agents_via_clockify()
@@ -319,14 +276,13 @@ def process_single_ticket(ticket_data):
         res = requests.get(f"{FD_BASE_URL}/tickets/{t_id}", auth=FD_AUTH)
         if not handle_rate_limits(res) and res.status_code == 200:
             full_ticket = res.json()
-            real_req_id = fix_requester_if_needed(full_ticket)
-            surviving_id = perform_merge_check(t_id, real_req_id, full_ticket)
             
-            if surviving_id:
-                if surviving_id != t_id:
-                     res2 = requests.get(f"{FD_BASE_URL}/tickets/{surviving_id}", auth=FD_AUTH)
-                     if res2.status_code == 200: full_ticket = res2.json()
-                manage_assignment(full_ticket)
+            # 1. Fix Email (So external merger works)
+            fix_requester_if_needed(full_ticket)
+            
+            # 2. Dispatch (No merging here)
+            manage_assignment(full_ticket)
+            
     except Exception as e: log(f"Error: {e}")
 
 # --- WORKER ---
@@ -356,12 +312,6 @@ def health(): return "OK", 200
 # --- SWEEPER ---
 def run_backlog_sweep():
     log("🧹 STARTING BACKLOG SWEEP...")
-    
-    # Verify Agent Configuration
-    if not AGENT_IDS:
-        log("⚠️ NO AGENT IDS LOADED. Please check Render Environment Variables!")
-        return
-
     wait_if_limited()
     page = 1
     query = "status:2 OR status:3 OR status:4" 
@@ -382,6 +332,7 @@ def run_backlog_sweep():
                 TICKET_QUEUE.put(ticket)
             
             if len(tickets) < 30: break 
+            
             if page >= 10:
                 log("🛑 Max Search Depth (300 tickets). Restarting soon...")
                 break
@@ -403,5 +354,5 @@ threading.Thread(target=background_worker, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
-    log(f"🚀 RENDER DISPATCHER (SAFE MODE) STARTED (Port {port})")
+    log(f"🚀 LIGHTWEIGHT DISPATCHER (NO MERGE) STARTED (Port {port})")
     app.run(host='0.0.0.0', port=port)
