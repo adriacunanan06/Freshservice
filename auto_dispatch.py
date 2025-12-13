@@ -31,11 +31,11 @@ IGNORE_EMAILS = [
     "notifications@shopify.com", "support@actorasupport.com"
 ]
 
-# PERFORMANCE SETTINGS (SAFE FOR 200 REQ/MIN)
-# 2 Workers x 5s delay = ~24 tickets/min.
-# Max 3 API calls per ticket = ~72 req/min (Very Safe)
-NUM_WORKER_THREADS = 2   
-WORKER_DELAY = 5.0       
+# PERFORMANCE SETTINGS (TURBO MODE - 500 REQ/MIN)
+# 5 Workers x 1.0s delay = ~150-200 tickets/min capacity.
+# Safely under the new 500 req/min limit.
+NUM_WORKER_THREADS = 5   
+WORKER_DELAY = 1.0       
 CLOCKIFY_CACHE_SECONDS = 60
 DRY_RUN = False  
 # ============================================================
@@ -65,7 +65,7 @@ def handle_rate_limits(response):
         with RATE_LOCK:
             if time.time() < RATE_LIMIT_UNTIL: return True
             retry = int(response.headers.get("Retry-After", 60))
-            RATE_LIMIT_UNTIL = time.time() + retry + 10
+            RATE_LIMIT_UNTIL = time.time() + retry + 5
             log(f"⚠️ RATE LIMIT HIT! Pausing for {retry}s...")
         return True
     return False
@@ -180,10 +180,6 @@ def get_or_create_contact(email):
 # --- LOGIC PIPELINE ---
 
 def fix_requester_if_needed(ticket):
-    """
-    CRITICAL: We still check this so your External Merger 
-    can match the correct email!
-    """
     tid = ticket['id']
     req_id = ticket['requester_id']
     if req_id == SHOPIFY_SENDER_ID:
@@ -277,10 +273,10 @@ def process_single_ticket(ticket_data):
         if not handle_rate_limits(res) and res.status_code == 200:
             full_ticket = res.json()
             
-            # 1. Fix Email (So external merger works)
+            # 1. Fix Email
             fix_requester_if_needed(full_ticket)
             
-            # 2. Dispatch (No merging here)
+            # 2. Dispatch (No merging)
             manage_assignment(full_ticket)
             
     except Exception as e: log(f"Error: {e}")
@@ -354,5 +350,6 @@ threading.Thread(target=background_worker, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
-    log(f"🚀 LIGHTWEIGHT DISPATCHER (NO MERGE) STARTED (Port {port})")
+    log(f"🚀 TURBO DISPATCHER (500 REQ/MIN) STARTED (Port {port})")
     app.run(host='0.0.0.0', port=port)
+        
