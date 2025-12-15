@@ -1,191 +1,366 @@
-import requests
+import threading
 import time
-import base64
 import json
-from datetime import datetime
+import logging
+import os
+import re
+import queue
+from datetime import datetime, timedelta, timezone
+from flask import Flask, request
+import requests
 
-# ================= CONFIGURATION =================
-FRESHDESK_DOMAIN = "https://actorasupport.freshdesk.com"
-API_KEY = "nToPJRmvqzHHWJ6pib36"
+# ================= PRODUCTION CONFIGURATION =================
+# 1. Credentials (Load from Render Environment)
+FD_DOMAIN = os.environ.get("FRESHDESK_DOMAIN")
+FD_API_KEY = os.environ.get("FRESHDESK_API_KEY")
+CLOCK_API_KEY = os.environ.get("CLOCKIFY_API_KEY")
 
-# The Daily Limit (In USD)
-DAILY_LIMIT_USD = 300.0
+# 2. Agent Management
+ENV_AGENT_LIST = os.environ.get("AGENT_IDS")
+AGENT_IDS = []
+if ENV_AGENT_LIST:
+    try:
+        AGENT_IDS = [int(x.strip()) for x in ENV_AGENT_LIST.split(',') if x.strip().isdigit()]
+    except: pass
 
-# Exchange Rates (Base: USD)
-EXCHANGE_RATES = {
-    "USD": 1.0,
-    "EUR": 1.10,
-    "GBP": 1.30,
-    "CAD": 0.75,
-    "AUD": 0.65,
-    "JPY": 0.007,
-    "PHP": 0.018,
-}
+SHOPIFY_SENDER_ID = int(os.environ.get("SHOPIFY_SENDER_ID", "0"))
 
-# Field Names (From your setup)
-REFUND_AMOUNT_FIELD = "cf_refund_amount_value"
-REFUND_CURRENCY_FIELD = "cf_refund_currency"
+# 3. Secondary Email Logic (Hidden in Env Vars)
+SECONDARY_CLOCKIFY_EMAIL = os.environ.get("SECONDARY_CLOCKIFY_EMAIL")
 
-# Status ID: 2 = Open
-STATUS_REQUESTING_REFUND = 2 
+IGNORE_EMAILS = [
+    "actorahelp@gmail.com", "customerservice@actorasupport.com", 
+    "mailer@shopify.com", "no-reply@shopify.com", 
+    "notifications@shopify.com", "support@actorasupport.com"
+]
 
-# =================================================
+# PERFORMANCE SETTINGS (OPTIMIZED FOR 2 SCRIPTS @ 500 REQ/MIN)
+# 4 Workers x 2.0s delay = ~120 tickets/min (~360 req/min).
+# Leaves ~140 req/min for your Refund Script.
+NUM_WORKER_THREADS = 4   
+WORKER_DELAY = 2.0       
+CLOCKIFY_CACHE_SECONDS = 60
+DRY_RUN = False  
+# ============================================================
 
-def get_headers():
-    auth_string = f"{API_KEY}:X"
-    auth_bytes = auth_string.encode('ascii')
-    base64_string = base64.b64encode(auth_bytes).decode('ascii')
-    return {
-        "Content-Type": "application/json",
-        "Authorization": f"Basic {base64_string}"
-    }
+app = Flask(__name__)
+FD_BASE_URL = f"https://{FD_DOMAIN}/api/v2"
+FD_AUTH = (FD_API_KEY, "X")
+FD_HEADERS = {"Content-Type": "application/json"}
+CLOCK_HEADERS = {"X-Api-Key": CLOCK_API_KEY}
 
+# GLOBAL STATE
+TICKET_QUEUE = queue.Queue()
+RATE_LIMIT_UNTIL = 0
+RATE_LOCK = threading.Lock()
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+def log(msg): logging.info(msg)
+
+CACHED_WORKSPACE_ID = None
+CACHED_CLOCKIFY_USERS = {} 
+STATUS_CACHE = {} 
+
+# --- RATE LIMIT HANDLER ---
 def handle_rate_limits(response):
-    """Checks for 429 Rate Limit errors and pauses if needed."""
+    global RATE_LIMIT_UNTIL
     if response.status_code == 429:
-        retry_after = int(response.headers.get("Retry-After", 60))
-        print(f"⚠️ Rate Limit Hit! Pausing Refund Bot for {retry_after}s...")
-        time.sleep(retry_after + 5)
+        with RATE_LOCK:
+            if time.time() < RATE_LIMIT_UNTIL: return True
+            retry = int(response.headers.get("Retry-After", 60))
+            RATE_LIMIT_UNTIL = time.time() + retry + 5
+            log(f"⚠️ RATE LIMIT HIT! Pausing for {retry}s...")
         return True
     return False
 
-def make_request(method, url, json_data=None):
-    """Wrapper to make requests with automatic rate limit handling."""
+def wait_if_limited():
+    remaining = RATE_LIMIT_UNTIL - time.time()
+    if remaining > 0: time.sleep(remaining)
+
+# --- CLOCKIFY LOGIC ---
+def init_clockify():
+    global CACHED_WORKSPACE_ID
+    if not CLOCK_API_KEY:
+        log("❌ Clockify Key Missing!")
+        return False
+
+    wait_if_limited()
+    try:
+        res = requests.get("https://api.clockify.me/api/v1/user", headers=CLOCK_HEADERS)
+        if res.status_code == 200:
+            user_data = res.json()
+            default_ws = user_data.get('defaultWorkspace')
+            active_ws = user_data.get('activeWorkspace')
+            CACHED_WORKSPACE_ID = default_ws if default_ws else active_ws
+            log(f"   👤 Clockify Connected: {user_data.get('name')}")
+            return True
+    except Exception as e: log(f"Clockify Error: {e}")
+    return False
+
+def build_clockify_cache():
+    global CACHED_CLOCKIFY_USERS
+    CACHED_CLOCKIFY_USERS = {}
+    if not CACHED_WORKSPACE_ID:
+        if not init_clockify(): return
+
+    wait_if_limited()
+    try:
+        res = requests.get(f"https://api.clockify.me/api/v1/workspaces/{CACHED_WORKSPACE_ID}/users", headers=CLOCK_HEADERS)
+        if res.status_code == 200:
+            for u in res.json():
+                CACHED_CLOCKIFY_USERS[u['email'].lower()] = u['id']
+    except: pass
+
+def is_user_clocked_in(email):
+    if not email: return False
+    email = email.lower()
+    
+    if email in STATUS_CACHE:
+        data = STATUS_CACHE[email]
+        if time.time() - data['last_check'] < CLOCKIFY_CACHE_SECONDS:
+            return data['is_online']
+
+    if not CACHED_CLOCKIFY_USERS: build_clockify_cache()
+    if email not in CACHED_CLOCKIFY_USERS: return False
+    
+    ws_id = CACHED_WORKSPACE_ID
+    user_id = CACHED_CLOCKIFY_USERS[email]
+    is_online = False
+    
+    wait_if_limited()
+    try:
+        url = f"https://api.clockify.me/api/v1/workspaces/{ws_id}/user/{user_id}/time-entries?in-progress=true"
+        res = requests.get(url, headers=CLOCK_HEADERS)
+        if res.status_code == 200:
+            entries = res.json()
+            if len(entries) > 0:
+                is_online = True
+    except: pass
+    
+    STATUS_CACHE[email] = { "is_online": is_online, "last_check": time.time() }
+    return is_online
+
+def get_active_agents_via_clockify():
+    active_list = []
+    if not CACHED_CLOCKIFY_USERS: build_clockify_cache()
+    
+    for agent_id in AGENT_IDS:
+        wait_if_limited()
+        try:
+            res = requests.get(f"{FD_BASE_URL}/agents/{agent_id}", auth=FD_AUTH)
+            if handle_rate_limits(res): continue
+            
+            if res.status_code == 200:
+                primary_email = res.json()['contact']['email']
+                is_active = is_user_clocked_in(primary_email)
+                
+                # Check for the specific agent ID (Lance) associated with secondary email
+                if agent_id == 159009628874 and not is_active:
+                    if SECONDARY_CLOCKIFY_EMAIL and is_user_clocked_in(SECONDARY_CLOCKIFY_EMAIL): 
+                        is_active = True
+                
+                # Check for the other specific agent ID (Cyril)
+                if agent_id == 159009628895 and not is_active:
+                     # Hardcoded fallback for Cyril per previous logic, or rely on Env if needed.
+                     # Assuming standard check is fine unless specified otherwise.
+                     pass
+
+                if is_active: active_list.append(agent_id)
+        except: pass
+    return active_list
+
+# --- FRESHDESK HELPERS ---
+def find_best_email(body_text):
+    if not body_text: return None
+    candidates = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', body_text)
+    for email in candidates:
+        if email.lower().strip() not in IGNORE_EMAILS: return email.lower().strip()
+    return None
+
+def get_or_create_contact(email):
+    wait_if_limited()
+    try:
+        res = requests.get(f"{FD_BASE_URL}/contacts?email={email}", auth=FD_AUTH)
+        if handle_rate_limits(res): return None
+        if res.status_code == 200 and len(res.json()) > 0: return res.json()[0]['id']
+        
+        if not DRY_RUN:
+            wait_if_limited()
+            res = requests.post(f"{FD_BASE_URL}/contacts", auth=FD_AUTH, headers=FD_HEADERS, json={"email": email, "name": email.split('@')[0]})
+            if handle_rate_limits(res): return None
+            if res.status_code == 201: return res.json()['id']
+    except: pass
+    return None
+
+# --- LOGIC PIPELINE ---
+
+def fix_requester_if_needed(ticket):
+    tid = ticket['id']
+    req_id = ticket['requester_id']
+    if req_id == SHOPIFY_SENDER_ID:
+        wait_if_limited()
+        try:
+            res = requests.get(f"{FD_BASE_URL}/tickets/{tid}?include=description", auth=FD_AUTH)
+            if handle_rate_limits(res): return req_id
+            
+            if res.status_code == 200:
+                body = res.json().get('description_text', '')
+                real_email = find_best_email(body)
+                if real_email:
+                    new_cid = get_or_create_contact(real_email)
+                    if new_cid and not DRY_RUN:
+                        wait_if_limited()
+                        requests.put(f"{FD_BASE_URL}/tickets/{tid}", auth=FD_AUTH, headers=FD_HEADERS, json={"requester_id": new_cid})
+                        log(f"   ✅ Fixed #{tid} Requester -> {real_email}")
+                        return new_cid
+        except: pass
+    return req_id
+
+def assign_to_agent(t_id, current_responder, status_label):
+    active_agents = get_active_agents_via_clockify()
+    target_responder = None
+    
+    if current_responder in active_agents:
+        target_responder = current_responder
+    else:
+        if active_agents:
+            import random
+            target_responder = random.choice(active_agents)
+        else:
+            target_responder = current_responder 
+
+    if target_responder and target_responder != current_responder:
+        if not DRY_RUN:
+            wait_if_limited()
+            res = requests.put(f"{FD_BASE_URL}/tickets/{t_id}", auth=FD_AUTH, headers=FD_HEADERS, json={"responder_id": target_responder})
+            if not handle_rate_limits(res) and res.status_code == 200:
+                log(f"   👮 Assigned #{t_id} -> Agent {target_responder} ({status_label})")
+
+def unassign_ticket(t_id, current_responder, status_label):
+    if current_responder is not None:
+        if not DRY_RUN:
+            wait_if_limited()
+            res = requests.put(f"{FD_BASE_URL}/tickets/{t_id}", auth=FD_AUTH, headers=FD_HEADERS, json={"responder_id": None})
+            if not handle_rate_limits(res) and res.status_code == 200:
+                log(f"   ⏸️ Unassigned #{t_id} ({status_label})")
+
+def manage_assignment(ticket):
+    t_id = ticket['id']
+    status = ticket['status']
+    current_responder = ticket.get('responder_id')
+    
+    # 4=Resolved: ALWAYS UNASSIGN
+    if status == 4:
+        unassign_ticket(t_id, current_responder, "Resolved")
+        return
+
+    # 2=Open: ALWAYS ASSIGN
+    if status == 2:
+        assign_to_agent(t_id, current_responder, "Open")
+        return
+
+    # 3=Pending: CHECK 24H RULE
+    if status == 3:
+        try:
+            updated_str = ticket.get('updated_at')
+            if updated_str:
+                if updated_str.endswith('Z'):
+                    updated_at = datetime.strptime(updated_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                else:
+                    updated_at = datetime.fromisoformat(updated_str).astimezone(timezone.utc)
+                
+                time_diff = datetime.now(timezone.utc) - updated_at
+                hours_passed = time_diff.total_seconds() / 3600
+                
+                if hours_passed > 24:
+                    assign_to_agent(t_id, current_responder, "Pending > 24h")
+                else:
+                    unassign_ticket(t_id, current_responder, "Pending < 24h")
+        except Exception as e:
+            log(f"   ⚠️ Date Error #{t_id}: {e}")
+
+def process_single_ticket(ticket_data):
+    wait_if_limited()
+    t_id = ticket_data['id']
+    
+    try:
+        res = requests.get(f"{FD_BASE_URL}/tickets/{t_id}", auth=FD_AUTH)
+        if not handle_rate_limits(res) and res.status_code == 200:
+            full_ticket = res.json()
+            # 1. Fix Email
+            fix_requester_if_needed(full_ticket)
+            # 2. Dispatch (No merge)
+            manage_assignment(full_ticket)
+            
+    except Exception as e: log(f"Error: {e}")
+
+# --- WORKER ---
+def worker(name):
+    log(f"🔧 Worker {name} started.")
+    while True:
+        ticket_data = TICKET_QUEUE.get()
+        try:
+            process_single_ticket(ticket_data)
+        except Exception as e: log(f"Worker Error: {e}")
+        finally:
+            TICKET_QUEUE.task_done()
+            time.sleep(WORKER_DELAY)
+
+# --- WEBHOOK ---
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.json
+    t_id = data.get('ticket_id')
+    if t_id:
+        TICKET_QUEUE.put({'id': t_id, 'requester_id': data.get('requester_id')})
+    return "Queued", 200
+
+@app.route('/', methods=['GET', 'HEAD'])
+def health(): return "OK", 200
+
+# --- SWEEPER ---
+def run_backlog_sweep():
+    log("🧹 STARTING BACKLOG SWEEP...")
+    wait_if_limited()
+    page = 1
+    query = "status:2 OR status:3 OR status:4" 
+    
     while True:
         try:
-            if method == "GET":
-                response = requests.get(url, headers=get_headers())
-            elif method == "PUT":
-                response = requests.put(url, headers=get_headers(), json=json_data)
-            elif method == "POST":
-                response = requests.post(url, headers=get_headers(), json=json_data)
+            res = requests.get(f"{FD_BASE_URL}/search/tickets?query=\"{query}\"&page={page}", auth=FD_AUTH)
+            if handle_rate_limits(res): break
+            if res.status_code != 200: 
+                log(f"❌ Sweep Error: {res.status_code} - {res.text}")
+                break
             
-            # If rate limited, loop and try again after sleeping
-            if handle_rate_limits(response):
-                continue
+            tickets = res.json().get('results', [])
+            if not tickets: break
             
-            return response
-        except Exception as e:
-            print(f"Request Error: {e}")
-            time.sleep(5)
-            continue
+            log(f"   🔎 Batch {page}: Queuing {len(tickets)} tickets...")
+            for ticket in tickets:
+                TICKET_QUEUE.put(ticket)
+            
+            if len(tickets) < 30: break 
+            if page >= 10:
+                log("🛑 Max Search Depth (300 tickets). Restarting soon...")
+                break
+            page += 1
+        except: break
+    log("✅ Sweep items queued.")
 
-def convert_to_usd(amount, currency):
-    if not currency or currency not in EXCHANGE_RATES:
-        return amount 
-    return round(amount * EXCHANGE_RATES[currency], 2)
-
-def get_todays_usage():
-    total_usd = 0.0
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    query = f"updated_at:>'{today_str}' AND tag:'Refund_Approved'"
-    url = f"{FRESHDESK_DOMAIN}/api/v2/search/tickets?query=\"{query}\""
+def background_worker():
+    for i in range(NUM_WORKER_THREADS):
+        threading.Thread(target=worker, args=(i,), daemon=True).start()
     
-    response = make_request("GET", url)
-    if response.status_code != 200:
-        print(f"⚠️ API Error reading usage: {response.text}")
-        return 0.0
-        
-    tickets = response.json().get('results', [])
-    
-    for t in tickets:
-        if 'Refund_Approved' in t['tags']:
-            custom_fields = t.get('custom_fields') or {}
-            amount = custom_fields.get(REFUND_AMOUNT_FIELD)
-            currency = custom_fields.get(REFUND_CURRENCY_FIELD)
-            
-            if amount:
-                usd_val = convert_to_usd(float(amount), currency)
-                total_usd += usd_val
-                
-    return total_usd
+    time.sleep(5) 
+    run_backlog_sweep()
+    while True:
+        time.sleep(900)
+        run_backlog_sweep()
 
-def process_requests():
-    current_total_usd = get_todays_usage()
-    remaining_budget = DAILY_LIMIT_USD - current_total_usd
-    
-    print(f"\n📊 STATUS REPORT")
-    print(f"Daily Limit:   ${DAILY_LIMIT_USD:.2f}")
-    print(f"Used Today:    ${current_total_usd:.2f}")
-    print(f"Remaining:     ${remaining_budget:.2f}")
-    
-    query = f"\"status:{STATUS_REQUESTING_REFUND}\""
-    url = f"{FRESHDESK_DOMAIN}/api/v2/search/tickets?query={query}"
-    
-    response = make_request("GET", url)
-    if response.status_code != 200:
-        return
-
-    requests_list = response.json().get('results', [])
-    
-    if not requests_list:
-        print("✅ No pending requests.")
-        return
-
-    print(f"🔍 Scanning {len(requests_list)} open tickets...")
-
-    count_processed = 0
-    for t in requests_list:
-        t_id = t['id']
-        tags = t['tags'] or []
-        
-        # Skip processed tickets
-        if "Refund_Approved" in tags or "Limit_Exceeded" in tags:
-            continue
-
-        custom_fields = t.get('custom_fields') or {}
-        amount_val = custom_fields.get(REFUND_AMOUNT_FIELD)
-        currency_val = custom_fields.get(REFUND_CURRENCY_FIELD)
-        
-        if not amount_val:
-            continue
-            
-        count_processed += 1
-        amount_native = float(amount_val)
-        currency_code = currency_val if currency_val else "USD"
-        amount_usd = convert_to_usd(amount_native, currency_code)
-        
-        print(f"   👉 Ticket #{t_id}: Requesting {amount_native} {currency_code} (${amount_usd} USD)...", end=" ")
-        
-        if amount_usd <= remaining_budget:
-            print("APPROVED ✅")
-            
-            new_tags = tags + ["Refund_Approved"]
-            
-            # Update Ticket
-            make_request("PUT", f"{FRESHDESK_DOMAIN}/api/v2/tickets/{t_id}", 
-                         {"tags": new_tags, "status": 2, "priority": 1})
-            
-            # Add Note
-            note = f"SYSTEM: Refund APPROVED.\nAmount: {amount_native} {currency_code} (${amount_usd} USD).\nBudget Used: ${current_total_usd + amount_usd:.2f}"
-            make_request("POST", f"{FRESHDESK_DOMAIN}/api/v2/tickets/{t_id}/notes", 
-                         {"body": note, "private": True})
-            
-            current_total_usd += amount_usd
-            remaining_budget -= amount_usd
-            
-        else:
-            print("PAUSED ⛔ (Over Budget)")
-            
-            new_tags = tags + ["Limit_Exceeded"]
-            
-            make_request("PUT", f"{FRESHDESK_DOMAIN}/api/v2/tickets/{t_id}", 
-                         {"tags": new_tags, "priority": 4})
-            
-            note = f"SYSTEM: Refund PAUSED. Daily limit reached.\nRequest: ${amount_usd} USD.\nRemaining: ${remaining_budget} USD."
-            make_request("POST", f"{FRESHDESK_DOMAIN}/api/v2/tickets/{t_id}/notes", 
-                         {"body": note, "private": True})
-        
-        # 🛑 PACING: Sleep 2 seconds between refunds to share API limit with Dispatcher
-        time.sleep(2.0)
-
-    if count_processed == 0:
-        print("   (No new refund requests found)")
+threading.Thread(target=background_worker, daemon=True).start()
 
 if __name__ == "__main__":
-    print("🤖 Auto-Refund Bot Started (Shared API Mode)...")
-    while True:
-        process_requests()
-        # Run every 60 seconds
-        print("   Sleeping for 60 seconds...")
-        time.sleep(60)
+    port = int(os.environ.get('PORT', 5000))
+    log(f"🚀 BALANCED DISPATCHER (4 Workers @ 2.0s) STARTED (Port {port})")
+    app.run(host='0.0.0.0', port=port)
