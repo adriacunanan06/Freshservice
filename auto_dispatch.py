@@ -25,6 +25,10 @@ if ENV_AGENT_LIST:
 
 SHOPIFY_SENDER_ID = int(os.environ.get("SHOPIFY_SENDER_ID", "0"))
 
+# 3. Secondary Email Logic (Hidden in Env Vars)
+# This variable holds the email address of the secondary Clockify account.
+SECONDARY_CLOCKIFY_EMAIL = os.environ.get("SECONDARY_CLOCKIFY_EMAIL")
+
 IGNORE_EMAILS = [
     "actorahelp@gmail.com", "customerservice@actorasupport.com", 
     "mailer@shopify.com", "no-reply@shopify.com", 
@@ -107,6 +111,7 @@ def build_clockify_cache():
     except: pass
 
 def is_user_clocked_in(email):
+    if not email: return False
     email = email.lower()
     
     if email in STATUS_CACHE:
@@ -148,6 +153,28 @@ def get_active_agents_via_clockify():
                 primary_email = res.json()['contact']['email']
                 is_active = is_user_clocked_in(primary_email)
                 
+                # --- DUAL IDENTITY LOGIC ---
+                # Check secondary email if the primary is offline
+                # Relies on specific Agent IDs being present in the ENV list
+                
+                # Logic for specific agents can be generalized or hardcoded based on ID if needed
+                # For this setup, we check the secondary email if the primary fails for specific IDs
+                
+                # Example: If Agent X is offline, check Secondary Email
+                # Since we want to keep code public-safe, we assume if ANY agent is offline
+                # but the SECONDARY_CLOCKIFY_EMAIL is online, we might want to activate a specific agent.
+                # Here we restore the specific logic for your team structure using IDs:
+                
+                # Check for the specific agent ID associated with the secondary email
+                # (159009628874 is the ID for the agent who uses the secondary email)
+                if agent_id == 159009628874 and not is_active:
+                    if SECONDARY_CLOCKIFY_EMAIL and is_user_clocked_in(SECONDARY_CLOCKIFY_EMAIL): 
+                        is_active = True
+                
+                # Check for the other specific agent ID (159009628895)
+                # This one uses a different secondary logic or just the primary check
+                # You can add another Env Var for this if needed, or keep it generic.
+                
                 if is_active: active_list.append(agent_id)
         except: pass
     return active_list
@@ -175,22 +202,6 @@ def get_or_create_contact(email):
     except: pass
     return None
 
-def merge_tickets(primary_id, secondary_ids):
-    if DRY_RUN or not secondary_ids: return False
-    url = f"{FD_BASE_URL}/tickets/merge"
-    payload = { "primary_id": primary_id, "ticket_ids": secondary_ids }
-    
-    wait_if_limited()
-    try:
-        res = requests.put(url, auth=FD_AUTH, headers=FD_HEADERS, data=json.dumps(payload))
-        if handle_rate_limits(res): return False
-        
-        if res.status_code in [200, 204]:
-            log(f"   ⚡ Merged {len(secondary_ids)} tickets into #{primary_id}")
-            return True
-    except: pass
-    return False
-
 # --- LOGIC PIPELINE ---
 
 def fix_requester_if_needed(ticket):
@@ -214,42 +225,6 @@ def fix_requester_if_needed(ticket):
                         return new_cid
         except: pass
     return req_id
-
-def perform_merge_check(t_id, requester_id, ticket_object):
-    """
-    Checks for duplicates and merges them.
-    POLICY: Latest (Newest) Ticket = Primary.
-    """
-    # Find all Open/Pending/Resolved tickets from this user
-    query = f"requester_id:{requester_id} AND (status:2 OR status:3 OR status:4)"
-    wait_if_limited()
-    try:
-        res = requests.get(f"{FD_BASE_URL}/search/tickets?query=\"{query}\"", auth=FD_AUTH)
-        if handle_rate_limits(res): return t_id
-        
-        if res.status_code == 200:
-            user_tickets = res.json().get('results', [])
-            
-            ids = [t['id'] for t in user_tickets]
-            if t_id not in ids: user_tickets.append(ticket_object)
-
-            if len(user_tickets) > 1:
-                # SORT: Ascending (Oldest -> Newest)
-                user_tickets.sort(key=lambda x: x['created_at'])
-                
-                # Primary is the LAST one (Newest)
-                primary = user_tickets[-1] 
-                secondary = [t['id'] for t in user_tickets if t['id'] != primary['id']]
-                
-                if secondary:
-                    log(f"   🔄 Found duplicates. Merging {secondary} -> #{primary['id']} (Newest)")
-                    if merge_tickets(primary['id'], secondary):
-                        if t_id in secondary: 
-                            return None # Current ticket is merged away
-                        else: 
-                            return primary['id'] # Current ticket IS the newest
-    except: pass
-    return t_id
 
 def assign_to_agent(t_id, current_responder, status_label):
     active_agents = get_active_agents_via_clockify()
@@ -322,14 +297,11 @@ def process_single_ticket(ticket_data):
         res = requests.get(f"{FD_BASE_URL}/tickets/{t_id}", auth=FD_AUTH)
         if not handle_rate_limits(res) and res.status_code == 200:
             full_ticket = res.json()
-            real_req_id = fix_requester_if_needed(full_ticket)
-            surviving_id = perform_merge_check(t_id, real_req_id, full_ticket)
+            # 1. Fix Email
+            fix_requester_if_needed(full_ticket)
+            # 2. Dispatch (No merge)
+            manage_assignment(full_ticket)
             
-            if surviving_id:
-                if surviving_id != t_id:
-                     res2 = requests.get(f"{FD_BASE_URL}/tickets/{surviving_id}", auth=FD_AUTH)
-                     if res2.status_code == 200: full_ticket = res2.json()
-                manage_assignment(full_ticket)
     except Exception as e: log(f"Error: {e}")
 
 # --- WORKER ---
@@ -379,7 +351,6 @@ def run_backlog_sweep():
                 TICKET_QUEUE.put(ticket)
             
             if len(tickets) < 30: break 
-            
             if page >= 10:
                 log("🛑 Max Search Depth (300 tickets). Restarting soon...")
                 break
@@ -401,5 +372,5 @@ threading.Thread(target=background_worker, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
-    log(f"🚀 MERGE-ENABLED DISPATCHER (LATEST=PRIMARY) STARTED (Port {port})")
+    log(f"🚀 TURBO DISPATCHER STARTED (Port {port})")
     app.run(host='0.0.0.0', port=port)
